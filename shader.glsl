@@ -27,6 +27,15 @@ float sdBox(vec3 p, vec3 b) {
 float sdSphere(vec3 p, float r) {
     return length(p) - r;
 }
+float sdPlane(vec3 p, vec3 n, float h) {
+    return dot(p, n) + h;
+}
+vec3 getSkyColor(vec3 rd) {
+    float sun = pow(max(dot(rd, normalize(vec3(0.3, 0.5, 0.1))), 0.0), 1000.0);
+    float sky = 0.5 * (rd.y + 1.0);
+    return vec3(0.6, 0.7, 1.0) * sky + vec3(20.0, 16.0, 8.0) * sun;
+}
+
 
 struct Hit {
     float dist;
@@ -34,7 +43,7 @@ struct Hit {
 };
 
 Hit map(vec3 p) {
-    Hit h = Hit(1e5, -1);
+    Hit h = Hit(10e10, -1);
     float d;
 
     d = sdGround(p);
@@ -57,6 +66,7 @@ vec3 getAlbedo(int mat) {
     if (mat == 0) return vec3(0.8);              // Walls/floor
     if (mat == 1) return vec3(1.0, 0.4, 0.2);     // Box
     if (mat == 2) return vec3(1.0);              // Chrome sphere (will be handled as mirror)
+    if (mat == 3) return vec3(1.0, 0.4, 0.6);    // Sun thing
     return vec3(0.0);
 }
 
@@ -93,7 +103,7 @@ Hit march(vec3 ro, vec3 rd, out vec3 pos, out vec3 normal) {
             return h;
         }
         t += h.dist;
-        if (t > 50.0) break;
+        if (t > 10e10) break;
     }
     pos = ro + rd * t;
     normal = vec3(0);
@@ -103,10 +113,10 @@ Hit march(vec3 ro, vec3 rd, out vec3 pos, out vec3 normal) {
 const float PI = 3.1415926535;
 
 vec3 getEmission(int mat) {
-    if (mat == 3) return vec3(20.0); // light
+    if (mat == 3) return vec3(10.01, 9.98, 10); // light
+    if (mat == 0) return vec3(0.01);
     return vec3(0.0);
 }
-
 
 vec3 raytrace(vec3 ro, vec3 rd) {
     vec3 accum = vec3(0.0);
@@ -115,7 +125,10 @@ vec3 raytrace(vec3 ro, vec3 rd) {
     for (int bounce = 0; bounce < 1e4; ++bounce) {
         vec3 pos, normal;
         Hit h = march(ro, rd, pos, normal);
-        if (h.mat < 0) break;
+        if (h.mat < 0) {
+            accum += throughput * getSkyColor(rd);
+            break;
+        }
 
         vec3 albedo = getAlbedo(h.mat);
         accum += throughput * getEmission(h.mat);
