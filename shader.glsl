@@ -33,7 +33,7 @@ float sdPlane(vec3 p, vec3 n, float h) {
 vec3 getSkyColor(vec3 rd) {
     float sun = pow(max(dot(rd, normalize(vec3(0.3, 0.5, 0.1))), 0.0), 1000.0);
     float sky = 0.5 * (rd.y + 1.0);
-    return vec3(0.6, 0.7, 1.0) * sky + vec3(20.0, 16.0, 8.0) * sun;
+    return vec3(0.6, 0.7, 1.0) * sky + vec3(1.2, 1.0, 0.8) * sun;
 }
 
 
@@ -51,6 +51,22 @@ Hit map(vec3 p) {
 
     d = sdBox(p - vec3(0.0, 0.5, 0.0), vec3(0.5));
     if (d < h.dist) { h.dist = d; h.mat = 1; }
+                        // Z, Y, X,          D, H, W
+    d = sdBox(p - vec3(0.0, 5.0, 0.0), vec3(5.0, 0.1, 5.0)); 
+    if (d < h.dist) { h.dist = d; h.mat = 0; } // ROOF
+
+    d = sdBox(p - vec3(-5.0, 0.5, 0.0), vec3(0.5, 5.0, 5.0));
+    if (d < h.dist) { h.dist = d; h.mat = 0; } // SOUTH
+    
+    d = sdBox(p - vec3(5.0, 0.5, 0.0), vec3(0.5, 5.0, 5.0));
+    if (d < h.dist) { h.dist = d; h.mat = 0; } // NORTH
+    
+    d = sdBox(p - vec3(0.0, 0.5, 5.0), vec3(5.0, 5.0, 0.5));
+    if (d < h.dist) { h.dist = d; h.mat = 0; } // EAST
+    
+    d = sdBox(p - vec3(0.0, 0.5, -5.0), vec3(5.0, 5.0, 0.5));
+    if (d < h.dist) { h.dist = d; h.mat = 0; } // EAST
+
 
     d = sdSphere(p - vec3(1.2, 0.5, 0.0), 0.5);
     if (d < h.dist) { h.dist = d; h.mat = 2; }
@@ -72,11 +88,14 @@ vec3 getAlbedo(int mat) {
 
 const int lightCount = 2;
 vec3 lights[lightCount] = vec3[](vec3(2, 3, 1), vec3(-3, 4, -2));
-vec3 lightColors[lightCount] = vec3[](vec3(10), vec3(6, 10, 15));
+vec3 lightColors[lightCount] = vec3[](vec3(20), vec3(10, 15, 30));
 
 float hash(vec2 p) {
-    return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+    p = fract(p * vec2(123.34, 456.21));
+    p += dot(p, p + 78.233);
+    return fract(p.x * p.y);
 }
+
 vec3 cosineSampleHemisphere(vec3 n, vec2 r) {
     float phi = 6.283185 * r.x;
     float r2 = sqrt(r.y);
@@ -89,12 +108,12 @@ vec3 cosineSampleHemisphere(vec3 n, vec2 r) {
 
 Hit march(vec3 ro, vec3 rd, out vec3 pos, out vec3 normal) {
     float t = 0.0;
-    for (int i = 0; i < 128; ++i) {
+    for (int i = 0; i < 1920 * 1080; ++i) {
         vec3 p = ro + rd * t;
         Hit h = map(p);
-        if (h.dist < 0.001) {
+        if (h.dist < 0.0001) {
             pos = p;
-            vec2 e = vec2(0.001, 0);
+            vec2 e = vec2(0.0001, 0);
             normal = normalize(vec3(
                 map(p + e.xyy).dist - map(p - e.xyy).dist,
                 map(p + e.yxy).dist - map(p - e.yxy).dist,
@@ -103,7 +122,7 @@ Hit march(vec3 ro, vec3 rd, out vec3 pos, out vec3 normal) {
             return h;
         }
         t += h.dist;
-        if (t > 10e10) break;
+        if (t > 10000) break;
     }
     pos = ro + rd * t;
     normal = vec3(0);
@@ -122,7 +141,7 @@ vec3 raytrace(vec3 ro, vec3 rd) {
     vec3 accum = vec3(0.0);
     vec3 throughput = vec3(1.0);
 
-    for (int bounce = 0; bounce < 1e4; ++bounce) {
+    for (int bounce = 0; bounce < 8; ++bounce) {
         vec3 pos, normal;
         Hit h = march(ro, rd, pos, normal);
         if (h.mat < 0) {
@@ -146,9 +165,9 @@ vec3 raytrace(vec3 ro, vec3 rd) {
             vec3 lightDir = toLight / lightDist;
 
             vec3 dummyPos, dummyNorm;
-            Hit shadow = march(pos + normal * 0.01, lightDir, dummyPos, dummyNorm);
+            Hit shadow = march(pos + normal * 0.001, lightDir, dummyPos, dummyNorm);
 
-            if (shadow.dist > lightDist - 0.01) {
+            if (shadow.dist > lightDist - 0.001) {
                 float nDotL = max(dot(normal, lightDir), 0.0);
                 vec3 light = lightColors[i] * nDotL / (lightDist * lightDist);
                 accum += throughput * albedo * light;
@@ -157,9 +176,9 @@ vec3 raytrace(vec3 ro, vec3 rd) {
 
 
         // === Next bounce direction ===
-        vec2 jitter = float(iFrame) * vec2(0.37, 0.71);
-        vec2 seed = gl_FragCoord.xy + float(bounce) * vec2(13.3, 7.7) + jitter;
+        vec2 seed = gl_FragCoord.xy + float(iFrame) * vec2(0.37, 0.71) + float(bounce) * vec2(13.3, 7.7);
         vec2 rand = vec2(hash(seed), hash(seed + 19.1));
+
         rd = cosineSampleHemisphere(normal, rand);
         ro = pos + normal * 0.01;
 
@@ -168,11 +187,11 @@ vec3 raytrace(vec3 ro, vec3 rd) {
         throughput *= 0.98; // small artificial damping to control runaway energy
 
         // === Russian Roulette termination ===
-        float p = max(max(throughput.r, throughput.g), throughput.b);
-        if (bounce >= 1) {
-            if (hash(gl_FragCoord.xy + float(bounce)) > p) break;
-            throughput /= p;
-        }
+        //float p = max(max(throughput.r, throughput.g), throughput.b);
+        //if (bounce >= 1) {
+        //    if (hash(gl_FragCoord.xy + float(bounce)) > p) break;
+        //    throughput /= p;
+        //}
     }
 
     return accum;
@@ -186,8 +205,9 @@ vec4 effect(vec4 color, Image prevFrame, vec2 uv, vec2 fragCoord) {
 
     if (iFrame == 0) return vec4(newColor, 1.0);
 
-    float blend = 1.0 / float(iFrame + 1);
-    vec3 result = mix(prev, newColor, blend);
+    const float alpha = 0.02; // Controls blending rate: lower = more stable
+    vec3 result = mix(prev, newColor, alpha);
+
 
     return vec4(result, 1.0);
 }
