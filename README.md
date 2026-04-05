@@ -99,10 +99,7 @@ You can also drag the project folder onto the LÖVE executable on Windows.
 
 The **Imported Objects** scene loads OBJ files from the `objects/` folder.
 
-Current repo examples:
-
-- `objects/cottage.obj`
-- `objects/Tree.obj`
+The default testing objects have been omittd due to license restrictions/conflicts
 
 Notes:
 
@@ -115,7 +112,6 @@ Notes:
 ```text
 .
 ├── .gitignore
-├── build.lua
 ├── Fancy.png
 ├── Love2D-SDF-RayTracer-LOGO.png
 ├── main.lua
@@ -130,7 +126,6 @@ Notes:
 - `main.lua` — app logic, controls, UI, camera, scene switching, accumulation management
 - `shader.glsl` — core ray tracing / path tracing shader
 - `objloader.lua` — simple & lightweight OBJ loader used by the imported-object scene
-- `build.lua` — packaging configuration
 - `objects/` — runtime OBJ models
 
 ## Possible next steps
@@ -143,6 +138,7 @@ Notes:
 - richer object import support
 
 ## License
+
 ```text
 Don Source-Available Non-Derivative License (DSANDL) v1.2
 
