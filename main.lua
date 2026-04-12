@@ -1,8 +1,9 @@
 local objloader = require("objloader")
 
--- ╓───────────────────────────────────╖
--- ║ Various Initial Tables and Values ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Various Initial Tables and Values ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Variables
 
@@ -24,7 +25,7 @@ local renderModes = {
     { name = "Fancy",      bounces = 30, steps = 128, shadows = true,  reflections = true,  scene = 1 },
 }
 
-local fpsOptions = { 0, 10, 30, 60, 90, 120, 144, 240, 420 }
+local fpsOptions = { 10, 30, 60, 90, 120, 144, 240, 420, 0}
 
 local sceneNames = {
     [0] = "Studio",
@@ -35,8 +36,8 @@ local sceneNames = {
 
 local limits = {
     renderScale = { min = 0.05, max = 4.00, step = 0.05, fastStep = 0.25 },
-    bounces     = { min = 1, max = 1000000, step = 1, fastStep = 1000 },
-    steps       = { min = 8, max = 1000000, step = 8, fastStep = 256 },
+    bounces     = { min = 1, max = 1000, step = 1, fastStep = 100 },
+    steps       = { min = 8, max = 1000, step = 8, fastStep = 100 },
     scene       = { min = 0, max = 3, step = 1, fastStep = 1 },
 }
 
@@ -51,13 +52,30 @@ local defaults = {
     }
 }
 
+local IMPORTED_TRIANGLE_HARD_CAP = 81920
+
 local importedScene = {
     path = "",
-    maxTriangles = 768,
+    maxTriangles = IMPORTED_TRIANGLE_HARD_CAP,
     loaded = false,
     triCount = 0,
+    sourceTriCount = 0,
+    meshCount = 0,
+
     meshVertsImage = nil,
+    meshNormalsImage = nil,
+    meshMatAImage = nil,
+    meshMatBImage = nil,
+
+    -- kept for compatibility with any UI/debug code still touching them
+    meshUVImage = nil,
+    meshMatIdImage = nil,
+
     meshTexSize = { 3, 1 },
+    materialIndexByName = {},
+    materialList = {},
+    materialTextures = {},
+    materialColors = {},
 }
 
 local modelBrowser = {
@@ -116,9 +134,10 @@ local fontTitle
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Globally Helpful Helper Functions ║
--- ╙───────────────────────────────────╜
+--[[╓───────────────────────────────────╖
+--  ║ Globally Helpful Helper Functions ║
+--  ╙───────────────────────────────────╜
+]]
 
 --#region Helpers
 
@@ -141,9 +160,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Vector3 Math and Components       ║
--- ╙───────────────────────────────────╜
+--[[╓───────────────────────────────────╖
+--  ║ Vector3 Math and Components       ║
+--  ╙───────────────────────────────────╜
+]]
 
 --#region Vec3
 
@@ -166,9 +186,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Render Accumulation Management    ║
--- ╙───────────────────────────────────╜
+--[[╓───────────────────────────────────╖
+--  ║ Render Accumulation Management    ║
+--  ╙───────────────────────────────────╜
+]]
 
 --#region Render Accumulation
 
@@ -251,9 +272,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Path and File Helpers             ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Path and File Helpers             ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Path and File Helpers
 
@@ -278,9 +300,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Imported OBJ Scene Management     ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Imported OBJ Scene Management     ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Imported OBJ Scene Management
 
@@ -300,68 +323,164 @@ local function getSelectedModelPath()
     return modelBrowser.files[modelBrowser.selectedIndex]
 end
 
-local function buildImportedScene(path, maxTriangles)
-    maxTriangles = maxTriangles or 768
-
-    local model, err = objloader.load(path)
-    local result = {
-        path = path,
-        maxTriangles = maxTriangles,
+local function newImportedSceneState(path, maxTriangles)
+    return {
+        path = path or "",
+        maxTriangles = maxTriangles or IMPORTED_TRIANGLE_HARD_CAP,
         loaded = false,
         triCount = 0,
+        sourceTriCount = 0,
+        meshCount = 0,
+
         meshVertsImage = nil,
+        meshNormalsImage = nil,
+        meshMatAImage = nil,
+        meshMatBImage = nil,
+
         meshUVImage = nil,
         meshMatIdImage = nil,
+
         meshTexSize = { 3, 1 },
         materialIndexByName = {},
         materialList = {},
         materialTextures = {},
         materialColors = {},
     }
+end
 
-    if not model then
+local function buildImportedScene(path, maxTriangles)
+    maxTriangles = clampInt(maxTriangles or IMPORTED_TRIANGLE_HARD_CAP, 1, IMPORTED_TRIANGLE_HARD_CAP)
+
+    local scene, err = objloader.load(path)
+    local result = newImportedSceneState(path, maxTriangles)
+
+    if not scene then
         print("Imported OBJ scene failed to load:", path, err or "")
         return result
     end
 
-    if not model.positions or not model.triangles or #model.positions == 0 or #model.triangles == 0 then
+    if not scene.meshes or #scene.meshes == 0 then
         print("Imported OBJ scene empty:", path)
         return result
     end
 
-    local minX, minY, minZ = model.positions[1][1], model.positions[1][2], model.positions[1][3]
-    local maxX, maxY, maxZ = minX, minY, minZ
+    local bounds = scene.bounds
+    local minv = bounds and bounds.min or nil
+    local maxv = bounds and bounds.max or nil
 
-    for i = 1, #model.positions do
-        local v = model.positions[i]
-        minX = math.min(minX, v[1])
-        minY = math.min(minY, v[2])
-        minZ = math.min(minZ, v[3])
-        maxX = math.max(maxX, v[1])
-        maxY = math.max(maxY, v[2])
-        maxZ = math.max(maxZ, v[3])
-    end
+    if not minv or not maxv then
+        local firstPos = nil
+        for _, mesh in ipairs(scene.meshes) do
+            if mesh.vertices and #mesh.vertices > 0 then
+                firstPos = mesh.vertices[1].position
+                break
+            end
+        end
 
-    local cx = (minX + maxX) * 0.5
-    local cy = (minY + maxY) * 0.5
-    local cz = (minZ + maxZ) * 0.5
+        if not firstPos then
+            print("Imported OBJ scene has no vertices:", path)
+            return result
+        end
 
-    local sx = maxX - minX
-    local sy = maxY - minY
-    local sz = maxZ - minZ
-    local maxExtent = math.max(sx, math.max(sy, sz))
-    local scale = maxExtent > 0 and (8.5 / maxExtent) or 1.0
+        minv = { firstPos[1], firstPos[2], firstPos[3] }
+        maxv = { firstPos[1], firstPos[2], firstPos[3] }
 
-    local stride = math.max(1, ceilDiv(#model.triangles, maxTriangles))
-    local selected = {}
-
-    for i = 1, #model.triangles, stride do
-        selected[#selected + 1] = model.triangles[i]
-        if #selected >= maxTriangles then
-            break
+        for _, mesh in ipairs(scene.meshes) do
+            for i = 1, #mesh.vertices do
+                local p = mesh.vertices[i].position
+                minv[1] = math.min(minv[1], p[1])
+                minv[2] = math.min(minv[2], p[2])
+                minv[3] = math.min(minv[3], p[3])
+                maxv[1] = math.max(maxv[1], p[1])
+                maxv[2] = math.max(maxv[2], p[2])
+                maxv[3] = math.max(maxv[3], p[3])
+            end
         end
     end
 
+    local cx = (minv[1] + maxv[1]) * 0.5
+    local cy = (minv[2] + maxv[2]) * 0.5
+    local cz = (minv[3] + maxv[3]) * 0.5
+
+    local sx = maxv[1] - minv[1]
+    local sy = maxv[2] - minv[2]
+    local sz = maxv[3] - minv[3]
+    local maxExtent = math.max(sx, math.max(sy, sz))
+    local scale = maxExtent > 0 and (8.5 / maxExtent) or 1.0
+
+    local totalTriangles = 0
+    for _, mesh in ipairs(scene.meshes) do
+        if mesh.indices then
+            totalTriangles = totalTriangles + math.floor(#mesh.indices / 3)
+        end
+    end
+
+    if totalTriangles <= 0 then
+        print("Imported OBJ scene has no triangles:", path)
+        return result
+    end
+
+    result.sourceTriCount = totalTriangles
+    result.meshCount = #scene.meshes
+
+    if totalTriangles > maxTriangles then
+        print(
+            "Imported OBJ exact mode rejected:",
+            path,
+            "source tris =",
+            totalTriangles,
+            "budget =",
+            maxTriangles,
+            "Increase IMPORTED_TRIANGLE_HARD_CAP in main.lua and HARD_MAX_MESH_TRIS in shader.glsl together."
+        )
+        return result
+    end
+
+    local selected = {}
+
+    for _, mesh in ipairs(scene.meshes) do
+        local triCount = math.floor((mesh.indices and #mesh.indices or 0) / 3)
+
+        for tri = 1, triCount do
+            local base = (tri - 1) * 3 + 1
+            selected[#selected + 1] = {
+                mesh = mesh,
+                i0 = mesh.indices[base],
+                i1 = mesh.indices[base + 1],
+                i2 = mesh.indices[base + 2],
+            }
+        end
+    end
+
+    local triCount = #selected
+    if triCount <= 0 then
+        print("Imported OBJ scene sampling produced no triangles:", path)
+        return result
+    end
+
+    local vertsImageData = love.image.newImageData(3, triCount, "rgba32f")
+    local normalsImageData = love.image.newImageData(3, triCount, "rgba32f")
+    local matAImageData = love.image.newImageData(1, triCount, "rgba32f")
+    local matBImageData = love.image.newImageData(1, triCount, "rgba32f")
+
+    local function scaledPos(v)
+        return
+            (v[1] - cx) * scale,
+            (v[2] - cy) * scale,
+            (v[3] - cz) * scale - 4.0
+    end
+
+    local function avg3(v)
+        if not v then
+            return 0.0
+        end
+        return ((v[1] or 0) + (v[2] or 0) + (v[3] or 0)) / 3.0
+    end
+
+    local function nsToRoughness(ns)
+        local t = clamp((tonumber(ns) or 0) / 1000.0, 0.0, 1.0)
+        return clamp(1.0 - math.sqrt(t), 0.02, 1.0)
+    end
 
     local function getOrCreateMaterialIndex(name)
         name = name or "default"
@@ -370,12 +489,14 @@ local function buildImportedScene(path, maxTriangles)
             return result.materialIndexByName[name]
         end
 
-        local m = (model.materials and model.materials[name]) or (model.materials and model.materials.default) or {
-            kd = { 1, 1, 1 },
-            ks = { 0, 0, 0 },
-            ke = { 0, 0, 0 },
-            mapKd = nil,
-        }
+        local m = (scene.materials and scene.materials[name]) or
+                  (scene.materials and scene.materials.default) or
+                  {
+                      kd = { 1, 1, 1 },
+                      ks = { 0, 0, 0 },
+                      ke = { 0, 0, 0 },
+                      ns = 0,
+                  }
 
         local idx = #result.materialList + 1
         result.materialIndexByName[name] = idx
@@ -386,90 +507,118 @@ local function buildImportedScene(path, maxTriangles)
             (m.kd and m.kd[3]) or 1,
         }
 
-        if m.mapKd and objloader.loadTextureImage then
-            local img, texErr = objloader.loadTextureImage(m.mapKd)
-            if img then
-                result.materialTextures[idx] = img
-                print("Loaded material texture:", name, m.mapKd)
-            else
-                print("Failed to load material texture:", name, m.mapKd, texErr or "")
-            end
-        end
-
         return idx
     end
 
+    local function getPackedMaterial(name)
+        name = name or "default"
+        local m = (scene.materials and scene.materials[name]) or
+                  (scene.materials and scene.materials.default) or
+                  {
+                      kd = { 1, 1, 1 },
+                      ks = { 0, 0, 0 },
+                      ke = { 0, 0, 0 },
+                      ns = 0,
+                  }
 
-    local triCount = #selected
-    local vertsImageData = love.image.newImageData(3, triCount, "rgba32f")
-    local uvImageData = love.image.newImageData(3, triCount, "rgba32f")
-    local matIdImageData = love.image.newImageData(1, triCount, "rgba32f")
+        getOrCreateMaterialIndex(name)
 
+        local albedo = {
+            clamp((m.kd and m.kd[1]) or 1, 0, 1),
+            clamp((m.kd and m.kd[2]) or 1, 0, 1),
+            clamp((m.kd and m.kd[3]) or 1, 0, 1),
+        }
 
-    local function scaledPos(v)
-        return (v[1] - cx) * scale,
-            (v[2] - cy) * scale,
-            (v[3] - cz) * scale - 4.0
-    end
+        local emission = {
+            math.max((m.ke and m.ke[1]) or 0, 0),
+            math.max((m.ke and m.ke[2]) or 0, 0),
+            math.max((m.ke and m.ke[3]) or 0, 0),
+        }
 
-    local function getUV(vti)
-        if vti and model.texcoords and model.texcoords[vti] then
-            return model.texcoords[vti][1], model.texcoords[vti][2]
-        end
-        return 0.0, 0.0
+        local metallic = clamp(avg3(m.ks), 0.0, 1.0)
+        local roughness = nsToRoughness(m.ns)
+
+        return {
+            albedo = albedo,
+            emission = emission,
+            metallic = metallic,
+            roughness = roughness,
+        }
     end
 
     for row = 1, triCount do
         local tri = selected[row]
-        local matIndex = getOrCreateMaterialIndex(tri.material)
+        local mesh = tri.mesh
+        local materialName = mesh.material or "default"
+        local packed = getPackedMaterial(materialName)
+
+        local verts = {
+            mesh.vertices[tri.i0],
+            mesh.vertices[tri.i1],
+            mesh.vertices[tri.i2],
+        }
 
         for col = 1, 3 do
-            local ref = tri.v[col]
-            local p = model.positions[ref.vi]
-            local px, py, pz = scaledPos(p)
-            vertsImageData:setPixel(col - 1, row - 1, px, py, pz, 0.0)
+            local v = verts[col]
+            local p = v.position or { 0, 0, 0 }
+            local n = v.normal or { 0, 1, 0 }
 
-            local u, v = getUV(ref.vti)
-            uvImageData:setPixel(col - 1, row - 1, u, v, 0.0, 0.0)
+            local px, py, pz = scaledPos(p)
+            vertsImageData:setPixel(col - 1, row - 1, px, py, pz, 1.0)
+            normalsImageData:setPixel(col - 1, row - 1, n[1], n[2], n[3], 1.0)
         end
 
-        matIdImageData:setPixel(0, row - 1, matIndex - 1, 0.0, 0.0, 0.0)
+        matAImageData:setPixel(
+            0, row - 1,
+            packed.albedo[1],
+            packed.albedo[2],
+            packed.albedo[3],
+            packed.roughness
+        )
+
+        matBImageData:setPixel(
+            0, row - 1,
+            packed.emission[1],
+            packed.emission[2],
+            packed.emission[3],
+            packed.metallic
+        )
     end
 
     result.loaded = true
     result.triCount = triCount
-    result.meshVertsImage = love.graphics.newImage(vertsImageData)
-    result.meshUVImage = love.graphics.newImage(uvImageData)
-    result.meshMatIdImage = love.graphics.newImage(matIdImageData)
     result.meshTexSize = { 3, triCount }
 
-    result.meshVertsImage:setFilter("nearest", "nearest")
-    result.meshUVImage:setFilter("nearest", "nearest")
-    result.meshMatIdImage:setFilter("nearest", "nearest")
+    result.meshVertsImage = love.graphics.newImage(vertsImageData)
+    result.meshNormalsImage = love.graphics.newImage(normalsImageData)
+    result.meshMatAImage = love.graphics.newImage(matAImageData)
+    result.meshMatBImage = love.graphics.newImage(matBImageData)
 
-    print("Imported OBJ loaded:", path, "sampled tris =", triCount, "materials =", #result.materialList)
+---@diagnostic disable: undefined-field
+    result.meshVertsImage:setFilter("nearest", "nearest")
+    result.meshNormalsImage:setFilter("nearest", "nearest")
+    result.meshMatAImage:setFilter("nearest", "nearest")
+    result.meshMatBImage:setFilter("nearest", "nearest")
+---@diagnostic enable: undefined-field
+
+    print(
+        "Imported OBJ loaded:",
+        path,
+        "source tris =", totalTriangles,
+        "uploaded tris =", triCount,
+        "meshes =", #scene.meshes,
+        "materials =", #result.materialList
+    )
+
     return result
 end
 
 local function loadSelectedModel()
     local path = getSelectedModelPath()
-    local maxTriangles = (importedScene and importedScene.maxTriangles) or 768
+    local maxTriangles = (importedScene and importedScene.maxTriangles) or IMPORTED_TRIANGLE_HARD_CAP
 
     if not path then
-        importedScene = {
-            path = "objects",
-            maxTriangles = maxTriangles,
-            loaded = false,
-            triCount = 0,
-            meshVertsImage = nil,
-            meshUVImage = nil,
-            meshMatIdImage = nil,
-            meshTexSize = { 3, 1 },
-            materialIndexByName = {},
-            materialList = {},
-            materialTextures = {},
-            materialColors = {},
-        }
+        importedScene = newImportedSceneState("objects", maxTriangles)
         print("No OBJ files found in objects/")
         return
     end
@@ -507,9 +656,11 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Input Capture and Pause State     ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Input Capture and Pause State     ║
+     ╙───────────────────────────────────╜
+]]
+
 
 --#region Input Capture and Pause State
 
@@ -551,9 +702,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Pause Menu Definitions            ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Pause Menu Definitions            ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Pause Menu Definitions
 
@@ -925,9 +1077,10 @@ registerMenuItem({
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Pause Menu Layout and Hit Testing ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Pause Menu Layout and Hit Testing ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Pause Menu Layout and Hit Testing
 
@@ -1007,9 +1160,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Shared UI Drawing Helpers         ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Shared UI Drawing Helpers         ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Shared UI Drawing Helpers
 
@@ -1054,9 +1208,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ LÖVE Runtime and Input Callbacks  ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ LÖVE Runtime and Input Callbacks  ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region LÖVE Runtime and Input Callbacks
 
@@ -1258,7 +1413,7 @@ function love.keypressed(key)
     elseif key == "f1" then
         uiState.compactHud = not uiState.compactHud
     else
-        print(tostring(key))
+        -- print(tostring(key))
         keysDown[key] = true
     end
 end
@@ -1324,9 +1479,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ UI Panels and Overlay Rendering   ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ UI Panels and Overlay Rendering   ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region UI Panels and Overlay Rendering
 
@@ -1557,9 +1713,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Final Draw Call to LÖVE for GPU   ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Final Draw Call to LÖVE for GPU   ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Final Draw Call to LÖVE for GPU
 
@@ -1583,7 +1740,15 @@ function love.draw()
         if importedScene.meshVertsImage then
             shader:send("meshVerts", importedScene.meshVertsImage)
         end
-
+        if importedScene.meshNormalsImage then
+            shader:send("meshNormals", importedScene.meshNormalsImage)
+        end
+        if importedScene.meshMatAImage then
+            shader:send("meshMatA", importedScene.meshMatAImage)
+        end
+        if importedScene.meshMatBImage then
+            shader:send("meshMatB", importedScene.meshMatBImage)
+        end
         accumDst:renderTo(function()
             love.graphics.clear(0, 0, 0, 1)
             love.graphics.setShader(shader)

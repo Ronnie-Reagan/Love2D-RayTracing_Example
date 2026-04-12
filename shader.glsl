@@ -13,8 +13,16 @@ extern int uSceneVariant;
 extern int uMeshTriCount;
 extern vec2 uMeshTexSize;
 uniform Image meshVerts;
+uniform Image meshNormals;
+uniform Image meshMatA;
+uniform Image meshMatB;
 
-const int HARD_MAX_MESH_TRIS = 2048;
+const int HARD_MAX_MESH_TRIS = 8192;
+const int IMPORTED_MAT_ID = 1000;
+
+vec4 gImportedMatA = vec4(0.8, 0.8, 0.8, 1.0); // rgb = albedo, a = roughness
+vec4 gImportedMatB = vec4(0.0, 0.0, 0.0, 0.0); // rgb = emission, a = metallic
+
 const float PI = 3.1415926535;
 const float INV_PI = 0.31830988618;
 const int HARD_MAX_STEPS = 999 * 999;
@@ -125,6 +133,14 @@ Material getMaterial(int mat) {
     m.metallic = 0.0;
     m.roughness = 1.0;
 
+    if (mat == IMPORTED_MAT_ID) {
+        m.albedo = saturate(gImportedMatA.rgb);
+        m.emission = max(gImportedMatB.rgb, vec3(0.0));
+        m.metallic = clamp(gImportedMatB.a, 0.0, 1.0);
+        m.roughness = clamp(gImportedMatA.a, 0.02, 1.0);
+        return m;
+    }
+
     if (mat == 0) {
          m.albedo = vec3(0.78, 0.76, 0.72);
         m.roughness = 0.92;
@@ -155,31 +171,25 @@ Material getMaterial(int mat) {
         m.emission = vec3(0.4, 0.9, 2.2);
         m.roughness = 1.0;
     } else if (mat == 8) {
-        // matte black camera body
         m.albedo = vec3(0.07, 0.075, 0.08);
         m.roughness = 0.82;
     } else if (mat == 9) {
-        // lens glass
         m.albedo = vec3(0.03, 0.035, 0.04);
         m.metallic = 0.0;
         m.roughness = 0.03;
     } else if (mat == 10) {
-        // metal / lens ring / mic pod
         m.albedo = vec3(0.22, 0.23, 0.25);
         m.metallic = 1.0;
         m.roughness = 0.18;
     } else if (mat == 11) {
-        // tally light
         m.albedo = vec3(1.0, 0.2, 0.15);
         m.emission = vec3(4.0, 0.5, 0.3);
         m.roughness = 0.35;
     } else if (mat == 12) {
-        // hall-of-mirrors panel
         m.albedo = vec3(0.985, 0.99, 1.0);
         m.metallic = 1.0;
         m.roughness = 0.002;
     } else if (mat == 13) {
-        // dark metal frame
         m.albedo = vec3(0.14, 0.145, 0.16);
         m.metallic = 1.0;
         m.roughness = 0.08;
@@ -259,15 +269,46 @@ vec3 toViewCameraLocal(vec3 p) {
     );
 }
 
-vec4 readMeshTexel(int col, int row) {
-    vec2 uv = vec2(
+vec2 getMeshVertexUV(int col, int row) {
+    return vec2(
         (float(col) + 0.5) / uMeshTexSize.x,
         (float(row) + 0.5) / uMeshTexSize.y
     );
-    return Texel(meshVerts, uv);
 }
 
-bool intersectTriangle(vec3 ro, vec3 rd, vec3 v0, vec3 v1, vec3 v2, out float t, out vec3 n) {
+vec2 getMeshMaterialUV(int row) {
+    return vec2(
+        0.5,
+        (float(row) + 0.5) / uMeshTexSize.y
+    );
+}
+
+vec4 readMeshPosTexel(int col, int row) {
+    return Texel(meshVerts, getMeshVertexUV(col, row));
+}
+
+vec4 readMeshNormalTexel(int col, int row) {
+    return Texel(meshNormals, getMeshVertexUV(col, row));
+}
+
+vec4 readMeshMaterialATexel(int row) {
+    return Texel(meshMatA, getMeshMaterialUV(row));
+}
+
+vec4 readMeshMaterialBTexel(int row) {
+    return Texel(meshMatB, getMeshMaterialUV(row));
+}
+
+bool intersectTriangle(
+    vec3 ro,
+    vec3 rd,
+    vec3 v0,
+    vec3 v1,
+    vec3 v2,
+    out float t,
+    out vec3 bary,
+    out vec3 faceNormal
+) {
     vec3 e1 = v1 - v0;
     vec3 e2 = v2 - v0;
     vec3 pvec = cross(rd, e2);
@@ -275,16 +316,19 @@ bool intersectTriangle(vec3 ro, vec3 rd, vec3 v0, vec3 v1, vec3 v2, out float t,
 
     if (abs(det) < 0.000001) {
         t = 0.0;
-        n = vec3(0.0, 1.0, 0.0);
+        bary = vec3(0.0);
+        faceNormal = vec3(0.0, 1.0, 0.0);
         return false;
     }
 
     float invDet = 1.0 / det;
     vec3 tvec = ro - v0;
+
     float u = dot(tvec, pvec) * invDet;
     if (u < 0.0 || u > 1.0) {
         t = 0.0;
-        n = vec3(0.0, 1.0, 0.0);
+        bary = vec3(0.0);
+        faceNormal = vec3(0.0, 1.0, 0.0);
         return false;
     }
 
@@ -292,19 +336,23 @@ bool intersectTriangle(vec3 ro, vec3 rd, vec3 v0, vec3 v1, vec3 v2, out float t,
     float v = dot(rd, qvec) * invDet;
     if (v < 0.0 || (u + v) > 1.0) {
         t = 0.0;
-        n = vec3(0.0, 1.0, 0.0);
+        bary = vec3(0.0);
+        faceNormal = vec3(0.0, 1.0, 0.0);
         return false;
     }
 
     t = dot(e2, qvec) * invDet;
     if (t <= HIT_EPS) {
-        n = vec3(0.0, 1.0, 0.0);
+        bary = vec3(0.0);
+        faceNormal = vec3(0.0, 1.0, 0.0);
         return false;
     }
 
-    n = normalize(cross(e1, e2));
-    if (dot(n, rd) > 0.0) {
-        n = -n;
+    bary = vec3(1.0 - u - v, u, v);
+
+    faceNormal = normalize(cross(e1, e2));
+    if (dot(faceNormal, rd) > 0.0) {
+        faceNormal = -faceNormal;
     }
 
     return true;
@@ -314,26 +362,53 @@ Hit traceImportedMesh(vec3 ro, vec3 rd, out vec3 pos, out vec3 normal) {
     float bestT = 1e20;
     int bestMat = -1;
     vec3 bestNormal = vec3(0.0);
+    vec4 bestMatA = vec4(0.8, 0.8, 0.8, 1.0);
+    vec4 bestMatB = vec4(0.0);
 
     for (int i = 0; i < HARD_MAX_MESH_TRIS; ++i) {
         if (i >= uMeshTriCount) break;
 
-        vec3 v0 = readMeshTexel(0, i).xyz;
-        vec3 v1 = readMeshTexel(1, i).xyz;
-        vec3 v2 = readMeshTexel(2, i).xyz;
+        vec3 v0 = readMeshPosTexel(0, i).xyz;
+        vec3 v1 = readMeshPosTexel(1, i).xyz;
+        vec3 v2 = readMeshPosTexel(2, i).xyz;
+
+        vec3 n0 = readMeshNormalTexel(0, i).xyz;
+        vec3 n1 = readMeshNormalTexel(1, i).xyz;
+        vec3 n2 = readMeshNormalTexel(2, i).xyz;
 
         float t;
-        vec3 n;
-        if (intersectTriangle(ro, rd, v0, v1, v2, t, n)) {
+        vec3 bary;
+        vec3 faceNormal;
+
+        if (intersectTriangle(ro, rd, v0, v1, v2, t, bary, faceNormal)) {
             if (t < bestT) {
                 bestT = t;
-                bestNormal = n;
-                bestMat = 0;
+
+                vec3 interpNormal = normalize(
+                    n0 * bary.x +
+                    n1 * bary.y +
+                    n2 * bary.z
+                );
+
+                if (length(interpNormal) < 0.0001) {
+                    interpNormal = faceNormal;
+                }
+
+                if (dot(interpNormal, rd) > 0.0) {
+                    interpNormal = -interpNormal;
+                }
+
+                bestNormal = interpNormal;
+                bestMatA = readMeshMaterialATexel(i);
+                bestMatB = readMeshMaterialBTexel(i);
+                bestMat = IMPORTED_MAT_ID;
             }
         }
     }
 
     if (bestMat >= 0) {
+        gImportedMatA = bestMatA;
+        gImportedMatB = bestMatB;
         pos = ro + rd * bestT;
         normal = bestNormal;
         return Hit(bestT, bestMat);
@@ -348,13 +423,15 @@ float shadowTraceImportedMesh(vec3 ro, vec3 rd, float maxDist) {
     for (int i = 0; i < HARD_MAX_MESH_TRIS; ++i) {
         if (i >= uMeshTriCount) break;
 
-        vec3 v0 = readMeshTexel(0, i).xyz;
-        vec3 v1 = readMeshTexel(1, i).xyz;
-        vec3 v2 = readMeshTexel(2, i).xyz;
+        vec3 v0 = readMeshPosTexel(0, i).xyz;
+        vec3 v1 = readMeshPosTexel(1, i).xyz;
+        vec3 v2 = readMeshPosTexel(2, i).xyz;
 
         float t;
-        vec3 n;
-        if (intersectTriangle(ro, rd, v0, v1, v2, t, n)) {
+        vec3 bary;
+        vec3 faceNormal;
+
+        if (intersectTriangle(ro, rd, v0, v1, v2, t, bary, faceNormal)) {
             if (t < maxDist) {
                 return 0.0;
             }
@@ -496,10 +573,10 @@ Hit map(vec3 p, int traceMode) {
         h = opUnion(h, mapMirrorHall(p));
     }
 
-    for (int i = 0; i < lightCount; ++i) {
-        int lightMat = 5 + i;
-        h = opUnion(h, Hit(sdSphere(p - getLightPos(i), LIGHT_RADIUS), lightMat));
-    }
+    //for (int i = 0; i < lightCount; ++i) {
+    //    int lightMat = 5 + i;
+    //    h = opUnion(h, Hit(sdSphere(p - getLightPos(i), LIGHT_RADIUS), lightMat));
+    //}
 
     if (traceMode == 1) {
         h = opUnion(h, mapReflectionCamera(p));

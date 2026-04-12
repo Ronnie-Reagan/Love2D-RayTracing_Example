@@ -1,6 +1,15 @@
 -- objloader.lua
 local M = {}
 
+local DEFAULT_OPTIONS = {
+    generateMissingNormals = true,
+    keepRawArrays = true,
+    splitByMaterial = true,
+    splitByObject = true,
+    splitByGroup = true,
+    splitBySmoothingGroup = true,
+}
+
 local function normalizePath(path)
     path = tostring(path or "")
     path = path:gsub("\\", "/")
@@ -24,6 +33,15 @@ local function joinPath(a, b)
     return a .. "/" .. b
 end
 
+local function dirname(path)
+    path = normalizePath(path)
+    local dir = path:match("^(.*)/[^/]*$")
+    if not dir or dir == "" then
+        return "."
+    end
+    return dir
+end
+
 local function basename(path)
     path = normalizePath(path)
     return path:match("([^/]+)$") or path
@@ -38,20 +56,167 @@ local function fileExistsOS(path)
     return false
 end
 
-local function parseVertex(line)
-    local x, y, z = line:match("^v%s+([%-%+%d%.eE]+)%s+([%-%+%d%.eE]+)%s+([%-%+%d%.eE]+)")
-    if not x or not y or not z then
-        return nil
+local function readTextOS(path)
+    local f, err = io.open(path, "rb")
+    if not f then
+        return nil, err
     end
-    return { tonumber(x), tonumber(y), tonumber(z) }
+    local text = f:read("*a")
+    f:close()
+    return text
 end
 
-local function parseFaceToken(token)
-    local v = token:match("^([%-%d]+)")
-    if not v then
-        return nil
+local function readTextLove(path)
+    if not love or not love.filesystem or not love.filesystem.getInfo(path) then
+        return nil, "not found in love.filesystem"
     end
-    return tonumber(v)
+    return love.filesystem.read(path)
+end
+
+local function trim(s)
+    return (tostring(s or ""):match("^%s*(.-)%s*$") or "")
+end
+
+local function clamp(x, a, b)
+    if x < a then return a end
+    if x > b then return b end
+    return x
+end
+
+local function parseFloat(value, fallback)
+    local n = tonumber(value)
+    if n == nil then
+        return fallback
+    end
+    return n
+end
+
+local function parseVec3(words, startIndex, fallback)
+    fallback = fallback or 0.0
+    return {
+        parseFloat(words[startIndex], fallback),
+        parseFloat(words[startIndex + 1], fallback),
+        parseFloat(words[startIndex + 2], fallback),
+    }
+end
+
+local function vec3sub(a, b)
+    return { a[1] - b[1], a[2] - b[2], a[3] - b[3] }
+end
+
+local function vec3cross(a, b)
+    return {
+        a[2] * b[3] - a[3] * b[2],
+        a[3] * b[1] - a[1] * b[3],
+        a[1] * b[2] - a[2] * b[1],
+    }
+end
+
+local function vec3length(v)
+    return math.sqrt(v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
+end
+
+local function vec3normalize(v)
+    local len = vec3length(v)
+    if len <= 1e-12 then
+        return { 0, 1, 0 }
+    end
+    return { v[1] / len, v[2] / len, v[3] / len }
+end
+
+local function vec3addInPlace(a, b)
+    a[1] = a[1] + b[1]
+    a[2] = a[2] + b[2]
+    a[3] = a[3] + b[3]
+end
+
+local function newBounds()
+    return {
+        min = { math.huge, math.huge, math.huge },
+        max = { -math.huge, -math.huge, -math.huge },
+    }
+end
+
+local function expandBounds(bounds, p)
+    if p[1] < bounds.min[1] then bounds.min[1] = p[1] end
+    if p[2] < bounds.min[2] then bounds.min[2] = p[2] end
+    if p[3] < bounds.min[3] then bounds.min[3] = p[3] end
+    if p[1] > bounds.max[1] then bounds.max[1] = p[1] end
+    if p[2] > bounds.max[2] then bounds.max[2] = p[2] end
+    if p[3] > bounds.max[3] then bounds.max[3] = p[3] end
+end
+
+local function finalizeBounds(bounds)
+    if bounds.min[1] == math.huge then
+        return {
+            min = { 0, 0, 0 },
+            max = { 0, 0, 0 },
+            size = { 0, 0, 0 },
+            center = { 0, 0, 0 },
+        }
+    end
+
+    local size = {
+        bounds.max[1] - bounds.min[1],
+        bounds.max[2] - bounds.min[2],
+        bounds.max[3] - bounds.min[3],
+    }
+
+    return {
+        min = { bounds.min[1], bounds.min[2], bounds.min[3] },
+        max = { bounds.max[1], bounds.max[2], bounds.max[3] },
+        size = size,
+        center = {
+            (bounds.min[1] + bounds.max[1]) * 0.5,
+            (bounds.min[2] + bounds.max[2]) * 0.5,
+            (bounds.min[3] + bounds.max[3]) * 0.5,
+        },
+    }
+end
+
+local function splitWords(line)
+    local words = {}
+    for word in line:gmatch("%S+") do
+        words[#words + 1] = word
+    end
+    return words
+end
+
+local function iterateLogicalLines(text)
+    text = tostring(text or ""):gsub("\r\n", "\n"):gsub("\r", "\n")
+    local physicalLines = {}
+    for line in (text .. "\n"):gmatch("(.-)\n") do
+        physicalLines[#physicalLines + 1] = line
+    end
+
+    local i = 0
+    local logicalLine = nil
+
+    return function()
+        while true do
+            i = i + 1
+            if i > #physicalLines then
+                if logicalLine ~= nil then
+                    local out = logicalLine
+                    logicalLine = nil
+                    return out
+                end
+                return nil
+            end
+
+            local line = physicalLines[i]
+            if line:sub(-1) == "\\" then
+                logicalLine = (logicalLine or "") .. line:sub(1, -2)
+            else
+                if logicalLine ~= nil then
+                    local out = logicalLine .. line
+                    logicalLine = nil
+                    return out
+                end
+                return line
+            end
+        end
+    end
 end
 
 local function resolveIndex(index, count)
@@ -61,220 +226,53 @@ local function resolveIndex(index, count)
     return count + index + 1
 end
 
-local function parseOBJLines(lineIterator)
-    local vertices = {}
-    local faces = {}
-
-    for line in lineIterator do
-        if line:sub(1, 2) == "v " then
-            local vertex = parseVertex(line)
-            if vertex then
-                vertices[#vertices + 1] = vertex
-            end
-
-        elseif line:sub(1, 2) == "f " then
-            local tokens = {}
-            for token in line:gmatch("%S+") do
-                if token ~= "f" then
-                    tokens[#tokens + 1] = token
-                end
-            end
-
-            if #tokens >= 3 then
-                local indices = {}
-                local valid = true
-
-                for i = 1, #tokens do
-                    local idx = parseFaceToken(tokens[i])
-                    if not idx then
-                        valid = false
-                        break
-                    end
-
-                    idx = resolveIndex(idx, #vertices)
-                    if idx < 1 or idx > #vertices then
-                        valid = false
-                        break
-                    end
-
-                    indices[#indices + 1] = idx
-                end
-
-                if valid then
-                    for i = 2, #indices - 1 do
-                        faces[#faces + 1] = { indices[1], indices[i], indices[i + 1] }
-                    end
-                end
-            end
-        end
+local function parsePosition(words)
+    if #words < 4 then
+        return nil
     end
 
-    return vertices, faces
+    local pos = {
+        parseFloat(words[2], 0.0),
+        parseFloat(words[3], 0.0),
+        parseFloat(words[4], 0.0),
+    }
+
+    local color = nil
+    if #words >= 7 then
+        color = {
+            clamp(parseFloat(words[5], 1.0), 0.0, 1.0),
+            clamp(parseFloat(words[6], 1.0), 0.0, 1.0),
+            clamp(parseFloat(words[7], 1.0), 0.0, 1.0),
+            (#words >= 8) and clamp(parseFloat(words[8], 1.0), 0.0, 1.0) or 1.0,
+        }
+    end
+
+    return pos, color
 end
 
-local function loadFromLoveFilesystem(path)
-    if not love.filesystem.getInfo(path) then
-        return nil, nil, "not found in love.filesystem"
-    end
-
-    local ok, vertices, faces = pcall(function()
-        return parseOBJLines(love.filesystem.lines(path))
-    end)
-
-    if not ok then
-        return nil, nil, vertices
-    end
-
-    return vertices, faces
-end
-
-local function loadFromOSFilesystem(path)
-    local file, err = io.open(path, "r")
-    if not file then
-        return nil, nil, err
-    end
-
-    local ok, vertices, faces = pcall(function()
-        return parseOBJLines(file:lines())
-    end)
-
-    file:close()
-
-    if not ok then
-        return nil, nil, vertices
-    end
-
-    return vertices, faces
-end
-
-function M.getSearchRoots()
-    local roots = {}
-    local seen = {}
-
-    local function add(path)
-        path = normalizePath(path)
-        if path == "" then
-            path = "."
-        end
-        if not seen[path] then
-            seen[path] = true
-            roots[#roots + 1] = path
-        end
-    end
-
-    add(".")
-
-    if love.filesystem.getSourceBaseDirectory then
-        add(love.filesystem.getSourceBaseDirectory())
-    end
-
-    if love.filesystem.getSaveDirectory then
-        add(love.filesystem.getSaveDirectory())
-    end
-
-    return roots
-end
-
-function M.getCandidatePaths(path)
-    path = normalizePath(path)
-    local nameOnly = basename(path)
-    local candidates = {}
-
-    local function add(kind, resolved)
-        candidates[#candidates + 1] = { kind = kind, path = normalizePath(resolved) }
-    end
-
-    add("love", path)
-    add("os", path)
-
-    for _, root in ipairs(M.getSearchRoots()) do
-        add("os", joinPath(root, path))
-        if not path:find("/") then
-            add("os", joinPath(root, joinPath("objects", path)))
-        end
-        if path:find("/") then
-            add("os", joinPath(root, nameOnly))
-        end
-    end
-
-    return candidates
-end
-
-function M.resolvePath(path)
-    local candidates = M.getCandidatePaths(path)
-
-    for _, candidate in ipairs(candidates) do
-        if candidate.kind == "love" then
-            if love.filesystem.getInfo(candidate.path) then
-                return "love", candidate.path, candidates
-            end
-        else
-            if fileExistsOS(candidate.path) then
-                return "os", candidate.path, candidates
-            end
-        end
-    end
-
-    return nil, nil, candidates
-end
-
-function M.listModels(folder)
-    folder = normalizePath(folder or "objects")
-    local found = {}
-    local seen = {}
-
-    local function addPath(rel)
-        rel = normalizePath(rel)
-        if rel:lower():match("%.obj$") and not seen[rel:lower()] then
-            seen[rel:lower()] = true
-            found[#found + 1] = rel
-        end
-    end
-
-    if love.filesystem.getInfo(folder, "directory") then
-        for _, name in ipairs(love.filesystem.getDirectoryItems(folder)) do
-            addPath(joinPath(folder, name))
-        end
-    end
-
-    for _, root in ipairs(M.getSearchRoots()) do
-        local abs = joinPath(root, folder):gsub("/", "\\")
-        local cmd = 'dir /b "' .. abs .. '" 2>nul'
-        local p = io.popen(cmd)
-        if p then
-            for line in p:lines() do
-                addPath(joinPath(folder, line))
-            end
-            p:close()
-        end
-    end
-
-    table.sort(found, function(a, b) return a:lower() < b:lower() end)
-    return found
-end
-
-
-local function parseTexcoord(line)
-    local u, v, w = line:match("^vt%s+([%-%+%d%.eE]+)%s+([%-%+%d%.eE]+)%s*([%-%+%d%.eE]*)")
-    if not u then
+local function parseTexcoord(words)
+    if #words < 2 then
         return nil
     end
     return {
-        tonumber(u) or 0.0,
-        tonumber(v) or 0.0,
-        tonumber(w) or 0.0
+        parseFloat(words[2], 0.0),
+        parseFloat(words[3], 0.0),
+        parseFloat(words[4], 0.0),
     }
 end
 
-local function parseNormal(line)
-    local x, y, z = line:match("^vn%s+([%-%+%d%.eE]+)%s+([%-%+%d%.eE]+)%s+([%-%+%d%.eE]+)")
-    if not x or not y or not z then
+local function parseNormal(words)
+    if #words < 4 then
         return nil
     end
-    return { tonumber(x), tonumber(y), tonumber(z) }
+    return vec3normalize({
+        parseFloat(words[2], 0.0),
+        parseFloat(words[3], 0.0),
+        parseFloat(words[4], 0.0),
+    })
 end
 
-local function parseFaceVertexToken(token, vertexCount, texcoordCount, normalCount)
+local function parseFaceRef(token, vertexCount, texcoordCount, normalCount)
     local vi, vti, vni = token:match("^([%-%d]+)/([%-%d]*)/([%-%d]*)$")
     if not vi then
         vi, vti = token:match("^([%-%d]+)/([%-%d]*)$")
@@ -285,7 +283,6 @@ local function parseFaceVertexToken(token, vertexCount, texcoordCount, normalCou
     if not vi then
         vi = token:match("^([%-%d]+)$")
     end
-
     if not vi then
         return nil
     end
@@ -325,145 +322,548 @@ local function parseFaceVertexToken(token, vertexCount, texcoordCount, normalCou
         vni = nil
     end
 
+    return { vi = vi, vti = vti, vni = vni }
+end
+
+local function decodeMapPath(line)
+    local rest = trim(line:match("^%S+%s+(.+)$"))
+    if rest == "" then
+        return nil
+    end
+
+    local candidate = nil
+    local tokens = splitWords(rest)
+    local i = 1
+    while i <= #tokens do
+        local token = tokens[i]
+        if token:sub(1, 1) == "-" then
+            i = i + 2
+        else
+            candidate = table.concat(tokens, " ", i)
+            break
+        end
+    end
+
+    if not candidate or candidate == "" then
+        candidate = rest
+    end
+    return trim(candidate)
+end
+
+local function newMaterial(name)
     return {
-        vi = vi,
-        vti = vti,
-        vni = vni,
+        name = name,
+        ka = { 0, 0, 0 },
+        kd = { 1, 1, 1 },
+        ks = { 0, 0, 0 },
+        ke = { 0, 0, 0 },
+        ns = 0.0,
+        d = 1.0,
+        illum = 2,
+        mapKd = nil,
+        mapKs = nil,
+        mapBump = nil,
+        mapD = nil,
     }
 end
 
-local function parseOBJLines(lineIterator)
-    local model = {
+local function parseMTLText(text, objPath)
+    local materials = {}
+    local current = nil
+    local objDir = dirname(objPath)
+
+    local function resolveAssetPath(rel)
+        rel = trim(rel)
+        if rel == "" then
+            return nil
+        end
+        return normalizePath(joinPath(objDir, rel))
+    end
+
+    for rawLine in iterateLogicalLines(text) do
+        local line = trim(rawLine:gsub("#.*$", ""))
+        if line ~= "" then
+            local words = splitWords(line)
+            local head = words[1]
+
+            if head == "newmtl" then
+                local name = trim(line:match("^newmtl%s+(.+)$"))
+                if name == "" then
+                    name = "unnamed_" .. tostring(#materials + 1)
+                end
+                current = newMaterial(name)
+                materials[name] = current
+
+            elseif current then
+                if head == "Ka" then
+                    current.ka = parseVec3(words, 2, 0.0)
+                elseif head == "Kd" then
+                    current.kd = parseVec3(words, 2, 0.0)
+                elseif head == "Ks" then
+                    current.ks = parseVec3(words, 2, 0.0)
+                elseif head == "Ke" then
+                    current.ke = parseVec3(words, 2, 0.0)
+                elseif head == "Ns" then
+                    current.ns = parseFloat(words[2], 0.0)
+                elseif head == "d" then
+                    current.d = clamp(parseFloat(words[2], 1.0), 0.0, 1.0)
+                elseif head == "Tr" then
+                    current.d = 1.0 - clamp(parseFloat(words[2], 0.0), 0.0, 1.0)
+                elseif head == "illum" then
+                    current.illum = math.floor(parseFloat(words[2], 2))
+                elseif head == "map_Kd" then
+                    current.mapKd = resolveAssetPath(decodeMapPath(line))
+                elseif head == "map_Ks" then
+                    current.mapKs = resolveAssetPath(decodeMapPath(line))
+                elseif head == "map_d" then
+                    current.mapD = resolveAssetPath(decodeMapPath(line))
+                elseif head == "map_Bump" or head == "bump" then
+                    current.mapBump = resolveAssetPath(decodeMapPath(line))
+                end
+            end
+        end
+    end
+
+    return materials
+end
+
+local function readText(kind, path)
+    if kind == "love" then
+        return readTextLove(path)
+    end
+    return readTextOS(path)
+end
+
+local function getSearchRoots()
+    local roots = {}
+    local seen = {}
+
+    local function add(path)
+        path = normalizePath(path)
+        if path == "" then
+            path = "."
+        end
+        if not seen[path] then
+            seen[path] = true
+            roots[#roots + 1] = path
+        end
+    end
+
+    add(".")
+
+    if love and love.filesystem then
+        if love.filesystem.getSourceBaseDirectory then
+            add(love.filesystem.getSourceBaseDirectory())
+        end
+        if love.filesystem.getSaveDirectory then
+            add(love.filesystem.getSaveDirectory())
+        end
+    end
+
+    return roots
+end
+
+function M.getSearchRoots()
+    return getSearchRoots()
+end
+
+function M.getCandidatePaths(path)
+    path = normalizePath(path)
+    local nameOnly = basename(path)
+    local candidates = {}
+
+    local function add(kind, resolved)
+        candidates[#candidates + 1] = { kind = kind, path = normalizePath(resolved) }
+    end
+
+    add("love", path)
+    add("os", path)
+
+    for _, root in ipairs(getSearchRoots()) do
+        add("os", joinPath(root, path))
+        if not path:find("/") then
+            add("os", joinPath(root, joinPath("objects", path)))
+        end
+        if path:find("/") then
+            add("os", joinPath(root, nameOnly))
+        end
+    end
+
+    return candidates
+end
+
+function M.resolvePath(path)
+    local candidates = M.getCandidatePaths(path)
+
+    for _, candidate in ipairs(candidates) do
+        if candidate.kind == "love" then
+            if love and love.filesystem and love.filesystem.getInfo(candidate.path) then
+                return "love", candidate.path, candidates
+            end
+        else
+            if fileExistsOS(candidate.path) then
+                return "os", candidate.path, candidates
+            end
+        end
+    end
+
+    return nil, nil, candidates
+end
+
+local function resolveRelativeTextFile(objBackend, objPath, relPath)
+    relPath = trim(relPath)
+    if relPath == "" then
+        return nil, nil
+    end
+
+    local baseDir = dirname(objPath)
+    local attempts = {
+        normalizePath(joinPath(baseDir, relPath)),
+        normalizePath(joinPath(baseDir, basename(relPath))),
+        normalizePath(relPath),
+        normalizePath(basename(relPath)),
+    }
+
+    local seen = {}
+    for _, candidate in ipairs(attempts) do
+        if candidate ~= "" and not seen[candidate] then
+            seen[candidate] = true
+            local text = readText(objBackend, candidate)
+            if text then
+                return candidate, text
+            end
+        end
+    end
+
+    return nil, nil
+end
+
+local function meshKeyForState(objectName, groupName, materialName, smoothingGroup, options)
+    local objectPart = options.splitByObject and objectName or "*"
+    local groupPart = options.splitByGroup and groupName or "*"
+    local materialPart = options.splitByMaterial and materialName or "*"
+    local smoothPart = options.splitBySmoothingGroup and smoothingGroup or "*"
+    return table.concat({ objectPart, groupPart, materialPart, smoothPart }, "\31")
+end
+
+local function newMesh(objectName, groupName, materialName, smoothingGroup)
+    return {
+        name = objectName ~= "" and objectName or groupName,
+        objectName = objectName,
+        groupName = groupName,
+        material = materialName,
+        smoothingGroup = smoothingGroup,
+        vertices = {},
+        indices = {},
+        bounds = newBounds(),
+        _vertexMap = {},
+        _missingNormalVertexIndices = {},
+        _faceCounter = 0,
+    }
+end
+
+local function addMeshVertex(mesh, scene, ref, uniqueTag)
+    local key = tostring(ref.vi) .. "/" .. tostring(ref.vti or 0) .. "/" .. tostring(ref.vni or 0)
+    if uniqueTag then
+        key = key .. "/" .. tostring(uniqueTag)
+    end
+
+    local existing = mesh._vertexMap[key]
+    if existing then
+        return existing
+    end
+
+    local p = scene.positions[ref.vi]
+    local vertex = {
+        position = { p[1], p[2], p[3] },
+        texcoord = ref.vti and scene.texcoords[ref.vti] and {
+            scene.texcoords[ref.vti][1],
+            scene.texcoords[ref.vti][2],
+            scene.texcoords[ref.vti][3],
+        } or nil,
+        normal = ref.vni and scene.normals[ref.vni] and {
+            scene.normals[ref.vni][1],
+            scene.normals[ref.vni][2],
+            scene.normals[ref.vni][3],
+        } or nil,
+        color = scene.colors[ref.vi] and {
+            scene.colors[ref.vi][1],
+            scene.colors[ref.vi][2],
+            scene.colors[ref.vi][3],
+            scene.colors[ref.vi][4],
+        } or nil,
+        source = { vi = ref.vi, vti = ref.vti, vni = ref.vni },
+    }
+
+    local index = #mesh.vertices + 1
+    mesh.vertices[index] = vertex
+    mesh._vertexMap[key] = index
+    expandBounds(mesh.bounds, vertex.position)
+
+    if not vertex.normal then
+        mesh._missingNormalVertexIndices[index] = true
+    end
+
+    return index
+end
+
+local function addTriangleToMesh(mesh, scene, a, b, c)
+    mesh._faceCounter = mesh._faceCounter + 1
+    local forceUnique = (mesh.smoothingGroup == "off")
+    local faceTag = forceUnique and mesh._faceCounter or nil
+
+    local ia = addMeshVertex(mesh, scene, a, faceTag and (faceTag .. ":1") or nil)
+    local ib = addMeshVertex(mesh, scene, b, faceTag and (faceTag .. ":2") or nil)
+    local ic = addMeshVertex(mesh, scene, c, faceTag and (faceTag .. ":3") or nil)
+
+    mesh.indices[#mesh.indices + 1] = ia
+    mesh.indices[#mesh.indices + 1] = ib
+    mesh.indices[#mesh.indices + 1] = ic
+end
+
+local function ensureMaterial(scene, name)
+    if not scene.materials[name] then
+        scene.materials[name] = newMaterial(name)
+    end
+    return scene.materials[name]
+end
+
+local function generateMissingNormalsForMesh(mesh)
+    if not next(mesh._missingNormalVertexIndices) then
+        mesh.bounds = finalizeBounds(mesh.bounds)
+        mesh.triangleCount = #mesh.indices / 3
+        return
+    end
+
+    local accum = {}
+    for index in pairs(mesh._missingNormalVertexIndices) do
+        accum[index] = { 0, 0, 0 }
+    end
+
+    for i = 1, #mesh.indices, 3 do
+        local ia = mesh.indices[i]
+        local ib = mesh.indices[i + 1]
+        local ic = mesh.indices[i + 2]
+
+        local a = mesh.vertices[ia].position
+        local b = mesh.vertices[ib].position
+        local c = mesh.vertices[ic].position
+
+        local ab = vec3sub(b, a)
+        local ac = vec3sub(c, a)
+        local n = vec3cross(ab, ac)
+
+        if accum[ia] then vec3addInPlace(accum[ia], n) end
+        if accum[ib] then vec3addInPlace(accum[ib], n) end
+        if accum[ic] then vec3addInPlace(accum[ic], n) end
+    end
+
+    for index, sum in pairs(accum) do
+        mesh.vertices[index].normal = vec3normalize(sum)
+    end
+
+    mesh.bounds = finalizeBounds(mesh.bounds)
+    mesh.triangleCount = #mesh.indices / 3
+end
+
+local function parseOBJText(text, backend, path, options)
+    options = options or DEFAULT_OPTIONS
+
+    local scene = {
+        source = { kind = backend, path = path },
         positions = {},
         texcoords = {},
         normals = {},
-        triangles = {},
+        colors = {},
         materials = {
-            default = {
-                kd = { 1, 1, 1 },
-                ks = { 0, 0, 0 },
-                ke = { 0, 0, 0 },
-                mapKd = nil,
-            }
+            default = newMaterial("default"),
         },
+        mtllibs = {},
+        meshes = {},
+        bounds = newBounds(),
     }
 
+    local meshLookup = {}
+    local currentObject = basename(path)
+    local currentGroup = "default"
     local currentMaterial = "default"
+    local currentSmoothingGroup = "on"
 
-    for rawLine in lineIterator do
-        local line = tostring(rawLine or ""):gsub("\r", "")
-        line = line:match("^%s*(.-)%s*$") or ""
+    local function getCurrentMesh()
+        ensureMaterial(scene, currentMaterial)
+        local key = meshKeyForState(currentObject, currentGroup, currentMaterial, currentSmoothingGroup, options)
+        local mesh = meshLookup[key]
+        if not mesh then
+            mesh = newMesh(currentObject, currentGroup, currentMaterial, currentSmoothingGroup)
+            scene.meshes[#scene.meshes + 1] = mesh
+            meshLookup[key] = mesh
+        end
+        return mesh
+    end
 
-        if line ~= "" and line:sub(1, 1) ~= "#" then
-            if line:sub(1, 2) == "v " then
-                local vertex = parseVertex(line)
-                if vertex then
-                    model.positions[#model.positions + 1] = vertex
+    for rawLine in iterateLogicalLines(text) do
+        local line = trim(rawLine:gsub("#.*$", ""))
+        if line ~= "" then
+            local words = splitWords(line)
+            local head = words[1]
+
+            if head == "v" then
+                local pos, color = parsePosition(words)
+                if pos then
+                    scene.positions[#scene.positions + 1] = pos
+                    scene.colors[#scene.colors + 1] = color
+                    expandBounds(scene.bounds, pos)
                 end
 
-            elseif line:sub(1, 3) == "vt " then
-                local texcoord = parseTexcoord(line)
-                if texcoord then
-                    model.texcoords[#model.texcoords + 1] = texcoord
+            elseif head == "vt" then
+                local tex = parseTexcoord(words)
+                if tex then
+                    scene.texcoords[#scene.texcoords + 1] = tex
                 end
 
-            elseif line:sub(1, 3) == "vn " then
-                local normal = parseNormal(line)
+            elseif head == "vn" then
+                local normal = parseNormal(words)
                 if normal then
-                    model.normals[#model.normals + 1] = normal
+                    scene.normals[#scene.normals + 1] = normal
                 end
 
-            elseif line:sub(1, 2) == "f " then
+            elseif head == "f" then
                 local refs = {}
                 local valid = true
-
-                for token in line:gmatch("%S+") do
-                    if token ~= "f" then
-                        local ref = parseFaceVertexToken(
-                            token,
-                            #model.positions,
-                            #model.texcoords,
-                            #model.normals
-                        )
-                        if not ref then
-                            valid = false
-                            break
-                        end
-                        refs[#refs + 1] = ref
+                for i = 2, #words do
+                    local ref = parseFaceRef(words[i], #scene.positions, #scene.texcoords, #scene.normals)
+                    if not ref then
+                        valid = false
+                        break
                     end
+                    refs[#refs + 1] = ref
                 end
 
                 if valid and #refs >= 3 then
+                    local mesh = getCurrentMesh()
                     for i = 2, #refs - 1 do
-                        model.triangles[#model.triangles + 1] = {
-                            material = currentMaterial,
-                            v = {
-                                { vi = refs[1].vi, vti = refs[1].vti, vni = refs[1].vni },
-                                { vi = refs[i].vi, vti = refs[i].vti, vni = refs[i].vni },
-                                { vi = refs[i + 1].vi, vti = refs[i + 1].vti, vni = refs[i + 1].vni },
-                            }
-                        }
+                        addTriangleToMesh(mesh, scene, refs[1], refs[i], refs[i + 1])
                     end
                 end
 
-            elseif line:sub(1, 7) == "usemtl " then
-                local name = line:match("^usemtl%s+(.+)$")
-                if name and name ~= "" then
-                    currentMaterial = name
-                    if not model.materials[currentMaterial] then
-                        model.materials[currentMaterial] = {
-                            kd = { 1, 1, 1 },
-                            ks = { 0, 0, 0 },
-                            ke = { 0, 0, 0 },
-                            mapKd = nil,
-                        }
+            elseif head == "o" then
+                currentObject = trim(line:match("^o%s+(.+)$"))
+                if currentObject == "" then
+                    currentObject = "unnamed_object"
+                end
+
+            elseif head == "g" then
+                currentGroup = trim(line:match("^g%s+(.+)$"))
+                if currentGroup == "" then
+                    currentGroup = "default"
+                end
+
+            elseif head == "usemtl" then
+                currentMaterial = trim(line:match("^usemtl%s+(.+)$"))
+                if currentMaterial == "" then
+                    currentMaterial = "default"
+                end
+                ensureMaterial(scene, currentMaterial)
+
+            elseif head == "s" then
+                currentSmoothingGroup = trim(line:match("^s%s+(.+)$"))
+                if currentSmoothingGroup == "" then
+                    currentSmoothingGroup = "on"
+                end
+                if currentSmoothingGroup == "0" then
+                    currentSmoothingGroup = "off"
+                end
+
+            elseif head == "mtllib" then
+                local libName = trim(line:match("^mtllib%s+(.+)$"))
+                if libName ~= "" then
+                    scene.mtllibs[#scene.mtllibs + 1] = libName
+                    local resolvedLibPath, libText = resolveRelativeTextFile(backend, path, libName)
+                    if libText then
+                        local parsed = parseMTLText(libText, resolvedLibPath)
+                        for name, material in pairs(parsed) do
+                            scene.materials[name] = material
+                        end
                     end
                 end
             end
         end
     end
 
-    return model
-end
+    scene.bounds = finalizeBounds(scene.bounds)
 
-local function loadFromLoveFilesystem(path)
-    if not love.filesystem.getInfo(path) then
-        return nil, "not found in love.filesystem"
+    for _, mesh in ipairs(scene.meshes) do
+        if options.generateMissingNormals then
+            generateMissingNormalsForMesh(mesh)
+        else
+            mesh.bounds = finalizeBounds(mesh.bounds)
+            mesh.triangleCount = #mesh.indices / 3
+        end
+        mesh._vertexMap = nil
+        mesh._missingNormalVertexIndices = nil
+        mesh._faceCounter = nil
     end
 
-    local ok, modelOrErr = pcall(function()
-        return parseOBJLines(love.filesystem.lines(path))
+    if not options.keepRawArrays then
+        scene.positions = nil
+        scene.texcoords = nil
+        scene.normals = nil
+        scene.colors = nil
+    end
+
+    return scene
+end
+
+function M.listModels(folder)
+    folder = normalizePath(folder or "objects")
+    local found = {}
+    local seen = {}
+
+    local function addPath(rel)
+        rel = normalizePath(rel)
+        if rel:lower():match("%.obj$") and not seen[rel:lower()] then
+            seen[rel:lower()] = true
+            found[#found + 1] = rel
+        end
+    end
+
+    if love and love.filesystem and love.filesystem.getInfo(folder, "directory") then
+        for _, name in ipairs(love.filesystem.getDirectoryItems(folder)) do
+            addPath(joinPath(folder, name))
+        end
+    end
+
+    local isWindows = package.config:sub(1, 1) == "\\"
+    for _, root in ipairs(getSearchRoots()) do
+        local abs = joinPath(root, folder)
+        local cmd
+        if isWindows then
+            cmd = 'dir /b "' .. abs:gsub("/", "\\") .. '" 2>nul'
+        else
+            cmd = 'ls -1 "' .. abs:gsub('"', '\\"') .. '" 2>/dev/null'
+        end
+
+        local p = io.popen(cmd)
+        if p then
+            for line in p:lines() do
+                addPath(joinPath(folder, line))
+            end
+            p:close()
+        end
+    end
+
+    table.sort(found, function(a, b)
+        return a:lower() < b:lower()
     end)
-
-    if not ok then
-        return nil, modelOrErr
-    end
-
-    return modelOrErr
+    return found
 end
 
-local function loadFromOSFilesystem(path)
-    local file, err = io.open(path, "r")
-    if not file then
-        return nil, err
-    end
+function M.load(path, options)
+    options = setmetatable(options or {}, {
+        __index = DEFAULT_OPTIONS,
+    })
 
-    local ok, modelOrErr = pcall(function()
-        return parseOBJLines(file:lines())
-    end)
-
-    file:close()
-
-    if not ok then
-        return nil, modelOrErr
-    end
-
-    return modelOrErr
-end
-
-function M.load(path)
     local backend, resolved, candidates = M.resolvePath(path)
-
     if not backend then
         print("OBJ loader: failed to resolve path: " .. tostring(path))
         print("OBJ loader: candidates tried:")
@@ -475,26 +875,32 @@ function M.load(path)
 
     print("OBJ loader: resolved '" .. tostring(path) .. "' via " .. backend .. " -> " .. resolved)
 
-    local model, err
-    if backend == "love" then
-        model, err = loadFromLoveFilesystem(resolved)
-    else
-        model, err = loadFromOSFilesystem(resolved)
-    end
-
-    if not model then
+    local text, err = readText(backend, resolved)
+    if not text then
         print("OBJ loader: load failed: " .. tostring(resolved) .. " :: " .. tostring(err))
         return nil, err
     end
 
+    local ok, sceneOrErr = pcall(function()
+        return parseOBJText(text, backend, resolved, options)
+    end)
+
+    if not ok then
+        print("OBJ loader: parse failed: " .. tostring(resolved) .. " :: " .. tostring(sceneOrErr))
+        return nil, sceneOrErr
+    end
+
+    local materialCount = 0
+    for _ in pairs(sceneOrErr.materials) do
+        materialCount = materialCount + 1
+    end
+
     print(
-        "OBJ loader: loaded positions=" .. tostring(#model.positions) ..
-        " texcoords=" .. tostring(#model.texcoords) ..
-        " normals=" .. tostring(#model.normals) ..
-        " triangles=" .. tostring(#model.triangles)
+        "OBJ loader: loaded meshes=" .. tostring(#sceneOrErr.meshes) ..
+        " materials=" .. tostring(materialCount)
     )
 
-    return model
+    return sceneOrErr
 end
 
 return M
