@@ -1,12 +1,18 @@
 local objloader = require("objloader")
+local importedscene = require("imported_scene")
+local governor = require("governor")
+local mathutil = require("shared.mathutil")
+local pathutil = require("shared.pathutil")
+local vec3 = require("shared.vec3")
 
--- ╓───────────────────────────────────╖
--- ║ Various Initial Tables and Values ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Various Initial Tables and Values ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Variables
 
-love.window.setMode(1900, 1060, { vsync = false })
+love.window.setMode(1900, 1060, { vsync = false, resizable = true})
 local width, height = love.graphics.getDimensions()
 
 local qualityPresets = {
@@ -17,14 +23,15 @@ local qualityPresets = {
     [1] = { name = "Potato", scale = 0.40, fps = 30 },
 }
 
-local renderModes = {
-    { name = "Ultra-Fast", bounces = 1,  steps = 32,  shadows = false, reflections = false, scene = 0 },
-    { name = "Fast",       bounces = 10, steps = 48,  shadows = false, reflections = false, scene = 0 },
-    { name = "Balanced",   bounces = 20, steps = 72,  shadows = true,  reflections = true,  scene = 0 },
-    { name = "Fancy",      bounces = 30, steps = 128, shadows = true,  reflections = true,  scene = 1 },
+local tracingModes = {
+    { name = "RGB Rasterization",  shaderMode = 0, defaultBounces = 1,  defaultSteps = 32,  defaultReflections = false },
+    { name = "RGB Ray Tracing",    shaderMode = 1, defaultBounces = 2,  defaultSteps = 48,  defaultReflections = true  },
+    { name = "Spectral Ray Tracing", shaderMode = 2, defaultBounces = 2,  defaultSteps = 64,  defaultReflections = true  },
+    { name = "Spectral Path Tracing", shaderMode = 3, defaultBounces = 20, defaultSteps = 72,  defaultReflections = true  },
+    { name = "Wave Optics Rendering", shaderMode = 4, defaultBounces = 24, defaultSteps = 96,  defaultReflections = true  },
 }
 
-local fpsOptions = { 0, 10, 30, 60, 90, 120, 144, 240, 420 }
+local fpsOptions = { 10, 30, 60, 90, 120, 144, 240, 420, 0}
 
 local sceneNames = {
     [0] = "Studio",
@@ -35,14 +42,14 @@ local sceneNames = {
 
 local limits = {
     renderScale = { min = 0.05, max = 4.00, step = 0.05, fastStep = 0.25 },
-    bounces     = { min = 1, max = 1000000, step = 1, fastStep = 1000 },
-    steps       = { min = 8, max = 1000000, step = 8, fastStep = 256 },
+    bounces     = { min = 1, max = 1000, step = 1, fastStep = 100 },
+    steps       = { min = 8, max = 1000, step = 8, fastStep = 100 },
     scene       = { min = 0, max = 3, step = 1, fastStep = 1 },
 }
 
 local defaults = {
     qualityIndex = 3,
-    modeIndex = 2,
+    tracingModeIndex = 4,
     camera = {
         pos   = { 3, 1.5, 3 },
         yaw   = 3.9465926535898,
@@ -51,13 +58,68 @@ local defaults = {
     }
 }
 
+local IMPORTED_TRIANGLE_HARD_CAP = 81920
+local IMPORTED_OBJECT_HARD_CAP = 4096
+local IMPORTED_MESH_HARD_CAP = 16384
+local IMPORTED_SCENE_DEPTH_OFFSET = -4.0
+
 local importedScene = {
     path = "",
-    maxTriangles = 768,
+    maxTriangles = IMPORTED_TRIANGLE_HARD_CAP,
     loaded = false,
+    importMode = "none",
+    budgetReason = "hard-cap",
+    budgetedTriangles = IMPORTED_TRIANGLE_HARD_CAP,
     triCount = 0,
+    sourceTriCount = 0,
+    objectCount = 0,
+    meshCount = 0,
+    sourceScene = nil,
+    bounds = nil,
+    objects = {},
+    meshes = {},
+    loadError = nil,
+    estimatedVRAMBytes = 0,
+    estimatedRAMBytes = 0,
+
+    triangleVertsImage = nil,
+    triangleNormalsImage = nil,
+    triangleMatAImage = nil,
+    triangleMatBImage = nil,
+    triangleMatCImage = nil,
+    triangleMatDImage = nil,
+
+    objectNodeAImage = nil,
+    objectNodeBImage = nil,
+    meshNodeAImage = nil,
+    meshNodeBImage = nil,
+    meshNodeCImage = nil,
+    bvhNodeAImage = nil,
+    bvhNodeBImage = nil,
+    bvhNodeCImage = nil,
+
     meshVertsImage = nil,
-    meshTexSize = { 3, 1 },
+    meshNormalsImage = nil,
+    meshMatAImage = nil,
+    meshMatBImage = nil,
+    meshMatCImage = nil,
+    meshMatDImage = nil,
+
+    -- kept for compatibility with any UI/debug code still touching them
+    meshUVImage = nil,
+    meshMatIdImage = nil,
+
+    meshTexSize = { 1, 1 },
+    triangleTexSize = { 1, 1 },
+    objectNodeTexSize = { 1, 1 },
+    meshNodeTexSize = { 1, 1 },
+    bvhNodeTexSize = { 1, 1 },
+    bvhNodeCount = 0,
+    bvhLeafTriangles = 8,
+    materialIndexByName = {},
+    materialList = {},
+    materialTextures = {},
+    materialColors = {},
 }
 
 local modelBrowser = {
@@ -69,23 +131,29 @@ local modelBrowser = {
 local qualityIndex = defaults.qualityIndex
 local renderScale = qualityPresets[qualityIndex].scale
 local fpsTarget = qualityPresets[qualityIndex].fps
+local runtimeGovernor = governor.new({
+    requestedRenderScale = renderScale,
+})
 
 local tracerSettings = {
-    modeIndex = defaults.modeIndex,
-    maxBounces = renderModes[defaults.modeIndex].bounces,
-    maxSteps = renderModes[defaults.modeIndex].steps,
-    shadows = renderModes[defaults.modeIndex].shadows,
-    reflections = renderModes[defaults.modeIndex].reflections,
-    sceneVariant = renderModes[defaults.modeIndex].scene,
+    tracingModeIndex = defaults.tracingModeIndex,
+    tracingMode = tracingModes[defaults.tracingModeIndex].shaderMode,
+    maxBounces = tracingModes[defaults.tracingModeIndex].defaultBounces,
+    maxSteps = tracingModes[defaults.tracingModeIndex].defaultSteps,
+    shadows = true,
+    reflections = tracingModes[defaults.tracingModeIndex].defaultReflections,
+    sceneVariant = 0,
 }
 
 local renderWidth = math.max(1, math.floor(width * renderScale))
 local renderHeight = math.max(1, math.floor(height * renderScale))
 
 local accumA, accumB, accumSrc, accumDst
+local radianceA, radianceB, radianceSrc, radianceDst
 local shader
 local currentFrame = 0
 local keysDown = {}
+local fallbackFloatImage
 
 local enableMouse = true
 local isPaused = false
@@ -97,6 +165,22 @@ local menuPositionsX = {}
 local menuPositionsY = {}
 local menuItemCallbacks = {}
 local lastMenuLayout = nil
+local loadSelectedModel
+local pausePageIndex = 2
+local pauseTabs = {}
+local dropdownState = {
+    open = false,
+    menuIndex = 0,
+    options = {},
+    x = 0,
+    y = 0,
+    w = 0,
+    rowH = 30,
+    hoveredOption = 0,
+    scrollIndex = 1,
+    visibleCount = 0,
+    maxVisible = 8,
+}
 
 local uiState = {
     showHud = true,
@@ -110,122 +194,179 @@ local camera = {
     fov   = defaults.camera.fov,
 }
 
+local previousCamera = {
+    pos   = { defaults.camera.pos[1], defaults.camera.pos[2], defaults.camera.pos[3] },
+    yaw   = defaults.camera.yaw,
+    pitch = defaults.camera.pitch,
+    fov   = defaults.camera.fov,
+}
+
 local fontSmall
 local fontBody
 local fontTitle
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Globally Helpful Helper Functions ║
--- ╙───────────────────────────────────╜
+--[[╓───────────────────────────────────╖
+--  ║ Globally Helpful Helper Functions ║
+--  ╙───────────────────────────────────╜
+]]
 
 --#region Helpers
 
 
-local function clamp(v, lo, hi)
-    return math.max(lo, math.min(hi, v))
-end
+local clamp = mathutil.clamp
+local clampInt = mathutil.clampInt
+local formatBool = mathutil.formatBool
+local boolToInt = mathutil.boolToInt
 
-local function clampInt(v, lo, hi)
-    return math.floor(clamp(v, lo, hi))
-end
-
-local function formatBool(v)
-    return v and "On" or "Off"
-end
-
-local function boolToInt(v)
-    return v and 1 or 0
+local function formatMiB(bytes)
+    return string.format("%.1f MiB", mathutil.bytesToMiB(bytes))
 end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Vector3 Math and Components       ║
--- ╙───────────────────────────────────╜
+--[[╓───────────────────────────────────╖
+--  ║ Vector3 Math and Components       ║
+--  ╙───────────────────────────────────╜
+]]
 
 --#region Vec3
 
-local function add(a, b) return { a[1] + b[1], a[2] + b[2], a[3] + b[3] } end
-local function sub(a, b) return { a[1] - b[1], a[2] - b[2], a[3] - b[3] } end
-local function mul(v, s) return { v[1] * s, v[2] * s, v[3] * s } end
-local function dot(a, b) return a[1] * b[1] + a[2] * b[2] + a[3] * b[3] end
+local add = vec3.add
+local sub = vec3.sub
+local mul = vec3.mul
+local dot = vec3.dot
 
 local function norm(v)
-    local m = math.sqrt(dot(v, v))
-    if m <= 0.000001 then
+    local out = vec3.normalize(v)
+    if dot(v, v) <= 0.000001 then
         return { 0, 0, 0 }
     end
-    return { v[1] / m, v[2] / m, v[3] / m }
+    return out
 end
 
-local function copyVec3(v)
-    return { v[1], v[2], v[3] }
+local copyVec3 = vec3.copy
+
+local function atan2(y, x)
+    if math.atan2 then
+        return math.atan2(y, x)
+    end
+    return math.atan(y, x)
+end
+
+local function syncPreviousCameraToCurrent()
+    previousCamera.pos = copyVec3(camera.pos)
+    previousCamera.yaw = camera.yaw
+    previousCamera.pitch = camera.pitch
+    previousCamera.fov = camera.fov
+end
+
+local function lookCameraAt(target)
+    local dx = target[1] - camera.pos[1]
+    local dy = target[2] - camera.pos[2]
+    local dz = target[3] - camera.pos[3]
+    local planar = math.max(0.0001, math.sqrt(dx * dx + dz * dz))
+
+    camera.yaw = atan2(dx, dz)
+    camera.pitch = atan2(dy, planar)
 end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Render Accumulation Management    ║
--- ╙───────────────────────────────────╜
+--[[╓───────────────────────────────────╖
+--  ║ Render Accumulation Management    ║
+--  ╙───────────────────────────────────╜
+]]
 
 --#region Render Accumulation
 
-local function swap()
+local function swapAccum()
     accumSrc, accumDst = accumDst, accumSrc
 end
 
-local function clearAll()
-    if accumA then
-        accumA:renderTo(function()
-            love.graphics.clear(0, 0, 0, 1)
-        end)
-    end
-    if accumB then
-        accumB:renderTo(function()
-            love.graphics.clear(0, 0, 0, 1)
-        end)
-    end
+local function swapRadianceCache()
+    radianceSrc, radianceDst = radianceDst, radianceSrc
 end
 
-local function resetAccum()
+local function clearCanvas(canvas, r, g, b, a)
+    if not canvas then
+        return
+    end
+
+    canvas:renderTo(function()
+        love.graphics.clear(r, g, b, a)
+    end)
+end
+
+local function clearAccumHistory()
+    clearCanvas(accumA, 0, 0, 0, 1)
+    clearCanvas(accumB, 0, 0, 0, 1)
+end
+
+local function clearLightingCache()
+    clearCanvas(radianceA, 0, 0, 0, 0)
+    clearCanvas(radianceB, 0, 0, 0, 0)
+end
+
+local function clearAll()
+    clearAccumHistory()
+    clearLightingCache()
+end
+
+local function configureCanvas(canvas, minFilter, magFilter)
+    canvas:setFilter(minFilter, magFilter)
+    canvas:setWrap("clamp", "clamp")
+    return canvas
+end
+
+local function resetAccum(preserveLightingCache)
     currentFrame = 0
-    clearAll()
+    clearAccumHistory()
+
+    if not preserveLightingCache then
+        clearLightingCache()
+    end
 end
 
 local function rebuildAccum()
     renderWidth = math.max(1, math.floor(width * renderScale))
     renderHeight = math.max(1, math.floor(height * renderScale))
 
-    accumA = love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" })
-    accumA:setFilter("linear", "linear")
+    accumA = configureCanvas(love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" }), "linear", "linear")
 
-    accumB = love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" })
-    accumB:setFilter("linear", "linear")
+    accumB = configureCanvas(love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" }), "linear", "linear")
+
+    radianceA = configureCanvas(love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" }), "nearest", "nearest")
+
+    radianceB = configureCanvas(love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" }), "nearest", "nearest")
 
     accumSrc = accumA
     accumDst = accumB
+    radianceSrc = radianceA
+    radianceDst = radianceB
 
     clearAll()
     currentFrame = 0
+    syncPreviousCameraToCurrent()
+    governor.updateRenderVRAMEstimate(runtimeGovernor, renderWidth, renderHeight)
 end
 
 local function applyPreset(index)
     qualityIndex = clampInt(index, 1, #qualityPresets)
     renderScale = qualityPresets[qualityIndex].scale
     fpsTarget = qualityPresets[qualityIndex].fps
+    governor.setRequestedRenderScale(runtimeGovernor, renderScale, limits.renderScale)
     rebuildAccum()
 end
 
-local function applyRenderMode(index)
-    tracerSettings.modeIndex = clampInt(index, 1, #renderModes)
-    local mode = renderModes[tracerSettings.modeIndex]
-    tracerSettings.maxBounces = mode.bounces
-    tracerSettings.maxSteps = mode.steps
-    tracerSettings.shadows = mode.shadows
-    tracerSettings.reflections = mode.reflections
-    tracerSettings.sceneVariant = mode.scene
+local function applyTracingMode(index)
+    tracerSettings.tracingModeIndex = clampInt(index, 1, #tracingModes)
+    local mode = tracingModes[tracerSettings.tracingModeIndex]
+    tracerSettings.tracingMode = mode.shaderMode
+    tracerSettings.maxBounces = mode.defaultBounces
+    tracerSettings.maxSteps = mode.defaultSteps
+    tracerSettings.reflections = mode.defaultReflections
     resetAccum()
 end
 
@@ -233,13 +374,17 @@ local function restoreDefaults()
     qualityIndex = defaults.qualityIndex
     renderScale = qualityPresets[qualityIndex].scale
     fpsTarget = qualityPresets[qualityIndex].fps
+    runtimeGovernor = governor.new({
+        requestedRenderScale = renderScale,
+    })
 
-    tracerSettings.modeIndex = defaults.modeIndex
-    tracerSettings.maxBounces = renderModes[defaults.modeIndex].bounces
-    tracerSettings.maxSteps = renderModes[defaults.modeIndex].steps
-    tracerSettings.shadows = renderModes[defaults.modeIndex].shadows
-    tracerSettings.reflections = renderModes[defaults.modeIndex].reflections
-    tracerSettings.sceneVariant = renderModes[defaults.modeIndex].scene
+    tracerSettings.tracingModeIndex = defaults.tracingModeIndex
+    tracerSettings.tracingMode = tracingModes[defaults.tracingModeIndex].shaderMode
+    tracerSettings.maxBounces = tracingModes[defaults.tracingModeIndex].defaultBounces
+    tracerSettings.maxSteps = tracingModes[defaults.tracingModeIndex].defaultSteps
+    tracerSettings.shadows = true
+    tracerSettings.reflections = tracingModes[defaults.tracingModeIndex].defaultReflections
+    tracerSettings.sceneVariant = 0
 
     camera.pos = copyVec3(defaults.camera.pos)
     camera.yaw = defaults.camera.yaw
@@ -247,40 +392,28 @@ local function restoreDefaults()
     camera.fov = defaults.camera.fov
 
     rebuildAccum()
+    governor.updateSceneEstimates(runtimeGovernor, importedScene)
 end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Path and File Helpers             ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Path and File Helpers             ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Path and File Helpers
 
-local function ceilDiv(a, b)
-    if not b or b == 0 then
-        return 1
-    end
-    return math.floor((a + b - 1) / b)
-end
-
-local function normalizePath(path)
-    path = tostring(path or "")
-    path = path:gsub("\\", "/")
-    path = path:gsub("/+", "/")
-    return path
-end
-
-local function basename(path)
-    path = normalizePath(path)
-    return path:match("([^/]+)$") or path
-end
+local ceilDiv = mathutil.ceilDiv
+local normalizePath = pathutil.normalize
+local basename = pathutil.basename
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Imported OBJ Scene Management     ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Imported OBJ Scene Management     ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Imported OBJ Scene Management
 
@@ -300,189 +433,337 @@ local function getSelectedModelPath()
     return modelBrowser.files[modelBrowser.selectedIndex]
 end
 
-local function buildImportedScene(path, maxTriangles)
-    maxTriangles = maxTriangles or 768
-
-    local model, err = objloader.load(path)
-    local result = {
-        path = path,
-        maxTriangles = maxTriangles,
+local function newImportedSceneState(path, maxTriangles)
+    return {
+        path = path or "",
+        maxTriangles = maxTriangles or IMPORTED_TRIANGLE_HARD_CAP,
         loaded = false,
+        importMode = "none",
+        budgetReason = "hard-cap",
+        budgetedTriangles = maxTriangles or IMPORTED_TRIANGLE_HARD_CAP,
         triCount = 0,
+        sourceTriCount = 0,
+        objectCount = 0,
+        meshCount = 0,
+        sourceScene = nil,
+        bounds = nil,
+        objects = {},
+        meshes = {},
+        loadError = nil,
+        estimatedVRAMBytes = 0,
+        estimatedRAMBytes = 0,
+
+        triangleVertsImage = nil,
+        triangleNormalsImage = nil,
+        triangleMatAImage = nil,
+        triangleMatBImage = nil,
+        triangleMatCImage = nil,
+        triangleMatDImage = nil,
+
+        objectNodeAImage = nil,
+        objectNodeBImage = nil,
+        meshNodeAImage = nil,
+        meshNodeBImage = nil,
+        meshNodeCImage = nil,
+        bvhNodeAImage = nil,
+        bvhNodeBImage = nil,
+        bvhNodeCImage = nil,
+
         meshVertsImage = nil,
+        meshNormalsImage = nil,
+        meshMatAImage = nil,
+        meshMatBImage = nil,
+        meshMatCImage = nil,
+        meshMatDImage = nil,
+
         meshUVImage = nil,
         meshMatIdImage = nil,
-        meshTexSize = { 3, 1 },
+
+        meshTexSize = { 1, 1 },
+        triangleTexSize = { 1, 1 },
+        objectNodeTexSize = { 1, 1 },
+        meshNodeTexSize = { 1, 1 },
+        bvhNodeTexSize = { 1, 1 },
+        bvhNodeCount = 0,
+        bvhLeafTriangles = 8,
         materialIndexByName = {},
         materialList = {},
         materialTextures = {},
         materialColors = {},
     }
-
-    if not model then
-        print("Imported OBJ scene failed to load:", path, err or "")
-        return result
-    end
-
-    if not model.positions or not model.triangles or #model.positions == 0 or #model.triangles == 0 then
-        print("Imported OBJ scene empty:", path)
-        return result
-    end
-
-    local minX, minY, minZ = model.positions[1][1], model.positions[1][2], model.positions[1][3]
-    local maxX, maxY, maxZ = minX, minY, minZ
-
-    for i = 1, #model.positions do
-        local v = model.positions[i]
-        minX = math.min(minX, v[1])
-        minY = math.min(minY, v[2])
-        minZ = math.min(minZ, v[3])
-        maxX = math.max(maxX, v[1])
-        maxY = math.max(maxY, v[2])
-        maxZ = math.max(maxZ, v[3])
-    end
-
-    local cx = (minX + maxX) * 0.5
-    local cy = (minY + maxY) * 0.5
-    local cz = (minZ + maxZ) * 0.5
-
-    local sx = maxX - minX
-    local sy = maxY - minY
-    local sz = maxZ - minZ
-    local maxExtent = math.max(sx, math.max(sy, sz))
-    local scale = maxExtent > 0 and (8.5 / maxExtent) or 1.0
-
-    local stride = math.max(1, ceilDiv(#model.triangles, maxTriangles))
-    local selected = {}
-
-    for i = 1, #model.triangles, stride do
-        selected[#selected + 1] = model.triangles[i]
-        if #selected >= maxTriangles then
-            break
-        end
-    end
-
-
-    local function getOrCreateMaterialIndex(name)
-        name = name or "default"
-
-        if result.materialIndexByName[name] then
-            return result.materialIndexByName[name]
-        end
-
-        local m = (model.materials and model.materials[name]) or (model.materials and model.materials.default) or {
-            kd = { 1, 1, 1 },
-            ks = { 0, 0, 0 },
-            ke = { 0, 0, 0 },
-            mapKd = nil,
-        }
-
-        local idx = #result.materialList + 1
-        result.materialIndexByName[name] = idx
-        result.materialList[idx] = name
-        result.materialColors[idx] = {
-            (m.kd and m.kd[1]) or 1,
-            (m.kd and m.kd[2]) or 1,
-            (m.kd and m.kd[3]) or 1,
-        }
-
-        if m.mapKd and objloader.loadTextureImage then
-            local img, texErr = objloader.loadTextureImage(m.mapKd)
-            if img then
-                result.materialTextures[idx] = img
-                print("Loaded material texture:", name, m.mapKd)
-            else
-                print("Failed to load material texture:", name, m.mapKd, texErr or "")
-            end
-        end
-
-        return idx
-    end
-
-
-    local triCount = #selected
-    local vertsImageData = love.image.newImageData(3, triCount, "rgba32f")
-    local uvImageData = love.image.newImageData(3, triCount, "rgba32f")
-    local matIdImageData = love.image.newImageData(1, triCount, "rgba32f")
-
-
-    local function scaledPos(v)
-        return (v[1] - cx) * scale,
-            (v[2] - cy) * scale,
-            (v[3] - cz) * scale - 4.0
-    end
-
-    local function getUV(vti)
-        if vti and model.texcoords and model.texcoords[vti] then
-            return model.texcoords[vti][1], model.texcoords[vti][2]
-        end
-        return 0.0, 0.0
-    end
-
-    for row = 1, triCount do
-        local tri = selected[row]
-        local matIndex = getOrCreateMaterialIndex(tri.material)
-
-        for col = 1, 3 do
-            local ref = tri.v[col]
-            local p = model.positions[ref.vi]
-            local px, py, pz = scaledPos(p)
-            vertsImageData:setPixel(col - 1, row - 1, px, py, pz, 0.0)
-
-            local u, v = getUV(ref.vti)
-            uvImageData:setPixel(col - 1, row - 1, u, v, 0.0, 0.0)
-        end
-
-        matIdImageData:setPixel(0, row - 1, matIndex - 1, 0.0, 0.0, 0.0)
-    end
-
-    result.loaded = true
-    result.triCount = triCount
-    result.meshVertsImage = love.graphics.newImage(vertsImageData)
-    result.meshUVImage = love.graphics.newImage(uvImageData)
-    result.meshMatIdImage = love.graphics.newImage(matIdImageData)
-    result.meshTexSize = { 3, triCount }
-
-    result.meshVertsImage:setFilter("nearest", "nearest")
-    result.meshUVImage:setFilter("nearest", "nearest")
-    result.meshMatIdImage:setFilter("nearest", "nearest")
-
-    print("Imported OBJ loaded:", path, "sampled tris =", triCount, "materials =", #result.materialList)
-    return result
 end
 
-local function loadSelectedModel()
+local function transformImportedBounds(bounds, cx, cy, cz, scale)
+    if not bounds or not bounds.min or not bounds.max then
+        return {
+            min = { 0, 0, 0 },
+            max = { 0, 0, 0 },
+            size = { 0, 0, 0 },
+            center = { 0, 0, 0 },
+        }
+    end
+
+    local transformed = {
+        min = { math.huge, math.huge, math.huge },
+        max = { -math.huge, -math.huge, -math.huge },
+    }
+
+    local function addCorner(px, py, pz)
+        px = -(px - cx) * scale
+        py =  (py - cy) * scale
+        pz = -(pz - cz) * scale + IMPORTED_SCENE_DEPTH_OFFSET
+
+        transformed.min[1] = math.min(transformed.min[1], px)
+        transformed.min[2] = math.min(transformed.min[2], py)
+        transformed.min[3] = math.min(transformed.min[3], pz)
+        transformed.max[1] = math.max(transformed.max[1], px)
+        transformed.max[2] = math.max(transformed.max[2], py)
+        transformed.max[3] = math.max(transformed.max[3], pz)
+    end
+
+    for xi = 0, 1 do
+        local px = (xi == 0) and bounds.min[1] or bounds.max[1]
+        for yi = 0, 1 do
+            local py = (yi == 0) and bounds.min[2] or bounds.max[2]
+            for zi = 0, 1 do
+                local pz = (zi == 0) and bounds.min[3] or bounds.max[3]
+                addCorner(px, py, pz)
+            end
+        end
+    end
+
+    return {
+        min = transformed.min,
+        max = transformed.max,
+        size = {
+            transformed.max[1] - transformed.min[1],
+            transformed.max[2] - transformed.min[2],
+            transformed.max[3] - transformed.min[3],
+        },
+        center = {
+            (transformed.min[1] + transformed.max[1]) * 0.5,
+            (transformed.min[2] + transformed.max[2]) * 0.5,
+            (transformed.min[3] + transformed.max[3]) * 0.5,
+        },
+    }
+end
+
+local function createNearestFloatImage(imageData)
+    local image = love.graphics.newImage(imageData)
+    image:setFilter("nearest", "nearest")
+    image:setWrap("clamp", "clamp")
+    return image
+end
+
+local function getTextureSizeLimit()
+    local limit = 8192
+
+    if love.graphics and love.graphics.getSystemLimits then
+        local systemLimits = love.graphics.getSystemLimits() or {}
+        limit = tonumber(systemLimits.texturesize)
+            or tonumber(systemLimits.maxtexturesize)
+            or tonumber(systemLimits.maxTextureSize)
+            or limit
+    end
+
+    return math.max(1, math.floor(limit))
+end
+
+local function getLinearAtlasLayout(itemCount, textureLimit)
+    itemCount = math.max(1, math.floor(itemCount or 1))
+    textureLimit = math.max(1, math.floor(textureLimit or getTextureSizeLimit()))
+
+    local columns = math.min(itemCount, textureLimit)
+    local rows = ceilDiv(itemCount, columns)
+    if rows > textureLimit then
+        return nil, string.format(
+            "Need %d texels but the GPU texture limit is %d x %d.",
+            itemCount,
+            textureLimit,
+            textureLimit
+        )
+    end
+
+    return {
+        columns = columns,
+        rows = rows,
+    }
+end
+
+local function getTriangleAtlasLayout(triangleCount, textureLimit)
+    triangleCount = math.max(1, math.floor(triangleCount or 1))
+    textureLimit = math.max(1, math.floor(textureLimit or getTextureSizeLimit()))
+
+    local triangleColumns = math.max(1, math.floor(textureLimit / 3))
+    if triangleColumns < 1 then
+        return nil, string.format(
+            "Texture width limit %d is too small for triangle vertex packing.",
+            textureLimit
+        )
+    end
+
+    triangleColumns = math.min(triangleCount, triangleColumns)
+    local rows = ceilDiv(triangleCount, triangleColumns)
+    if rows > textureLimit then
+        return nil, string.format(
+            "Need %d triangles but the GPU texture limit is %d x %d.",
+            triangleCount,
+            textureLimit,
+            textureLimit
+        )
+    end
+
+    return {
+        triangleColumns = triangleColumns,
+        rows = rows,
+        vertexWidth = triangleColumns * 3,
+        materialWidth = triangleColumns,
+    }
+end
+
+local function getLinearAtlasCoord(indexZero, columns)
+    columns = math.max(1, math.floor(columns or 1))
+    local x = indexZero % columns
+    local y = math.floor(indexZero / columns)
+    return x, y
+end
+
+local function getFallbackFloatImage()
+    if fallbackFloatImage then
+        return fallbackFloatImage
+    end
+
+    local imageData = love.image.newImageData(1, 1, "rgba32f")
+    imageData:setPixel(0, 0, 0.0, 0.0, 0.0, 0.0)
+    fallbackFloatImage = createNearestFloatImage(imageData)
+    return fallbackFloatImage
+end
+
+local function getImportedSourceObjects(scene, path)
+    if scene.objects and #scene.objects > 0 then
+        return scene.objects
+    end
+
+    local meshIndices = {}
+    for meshIndex = 1, #scene.meshes do
+        meshIndices[#meshIndices + 1] = meshIndex
+    end
+
+    return {
+        {
+            name = basename(path),
+            meshIndices = meshIndices,
+            bounds = scene.bounds,
+            triangleCount = scene.totalTriangles or 0,
+        }
+    }
+end
+
+local function buildImportedScene(path, maxTriangles)
+    maxTriangles = clampInt(maxTriangles or IMPORTED_TRIANGLE_HARD_CAP, 1, IMPORTED_TRIANGLE_HARD_CAP)
+
+    return importedscene.build(path, {
+        maxTriangles = maxTriangles,
+        maxObjects = IMPORTED_OBJECT_HARD_CAP,
+        maxMeshes = IMPORTED_MESH_HARD_CAP,
+        depthOffset = IMPORTED_SCENE_DEPTH_OFFSET,
+        governor = governor,
+        governorState = runtimeGovernor,
+        renderVRAMBytes = runtimeGovernor.estimatedRenderVRAMBytes or 0,
+    })
+end
+
+local function sendImportedSceneUniforms()
+    local fallback = getFallbackFloatImage()
+
+    shader:send("uMeshTriCount", importedScene.triCount or 0)
+    shader:send("uImportedObjectCount", importedScene.objectCount or 0)
+    shader:send("uImportedMeshCount", importedScene.meshCount or 0)
+    shader:send("uMeshTexSize", importedScene.triangleTexSize or importedScene.meshTexSize or { 1, 1 })
+    shader:send("uObjectNodeTexSize", importedScene.objectNodeTexSize or { 1, 1 })
+    shader:send("uMeshNodeTexSize", importedScene.meshNodeTexSize or { 1, 1 })
+    shader:send("uImportedBvhNodeCount", importedScene.bvhNodeCount or 0)
+    shader:send("uImportedBvhTexSize", importedScene.bvhNodeTexSize or { 1, 1 })
+
+    shader:send("meshVerts", importedScene.triangleVertsImage or importedScene.meshVertsImage or fallback)
+    shader:send("meshNormals", importedScene.triangleNormalsImage or importedScene.meshNormalsImage or fallback)
+    shader:send("meshMatA", importedScene.triangleMatAImage or importedScene.meshMatAImage or fallback)
+    shader:send("meshMatB", importedScene.triangleMatBImage or importedScene.meshMatBImage or fallback)
+    shader:send("meshMatC", importedScene.triangleMatCImage or importedScene.meshMatCImage or fallback)
+    shader:send("meshMatD", importedScene.triangleMatDImage or importedScene.meshMatDImage or fallback)
+    shader:send("objectNodeA", importedScene.objectNodeAImage or fallback)
+    shader:send("objectNodeB", importedScene.objectNodeBImage or fallback)
+    shader:send("meshNodeA", importedScene.meshNodeAImage or fallback)
+    shader:send("meshNodeB", importedScene.meshNodeBImage or fallback)
+    shader:send("meshNodeC", importedScene.meshNodeCImage or fallback)
+    shader:send("importedBvhNodeA", importedScene.bvhNodeAImage or fallback)
+    shader:send("importedBvhNodeB", importedScene.bvhNodeBImage or fallback)
+    shader:send("importedBvhNodeC", importedScene.bvhNodeCImage or fallback)
+end
+
+local function sendFrameUniforms(passType, historyTex, cacheTex, overrides)
+    overrides = overrides or {}
+
+    shader:send("uPassType", passType)
+    shader:send("iFrame", overrides.frameIndex or currentFrame)
+    shader:send("iResolution", { renderWidth, renderHeight })
+    shader:send("camPos", camera.pos)
+    shader:send("yaw", camera.yaw)
+    shader:send("pitch", camera.pitch)
+    shader:send("camFov", camera.fov)
+    shader:send("prevCamPos", previousCamera.pos)
+    shader:send("prevYaw", previousCamera.yaw)
+    shader:send("prevPitch", previousCamera.pitch)
+    shader:send("prevCamFov", previousCamera.fov)
+    shader:send("tex", historyTex or getFallbackFloatImage())
+    shader:send("radianceCache", cacheTex or getFallbackFloatImage())
+
+    shader:send("uMaxBounces", overrides.maxBounces or tracerSettings.maxBounces)
+    shader:send("uMaxSteps", overrides.maxSteps or tracerSettings.maxSteps)
+    shader:send("uEnableShadows", boolToInt(tracerSettings.shadows))
+    shader:send("uEnableReflections", boolToInt(overrides.enableReflections ~= nil and overrides.enableReflections or tracerSettings.reflections))
+    shader:send("uSceneVariant", tracerSettings.sceneVariant)
+    shader:send("uTracingMode", overrides.tracingMode or tracerSettings.tracingMode or 3)
+
+    sendImportedSceneUniforms()
+end
+
+loadSelectedModel = function()
     local path = getSelectedModelPath()
-    local maxTriangles = (importedScene and importedScene.maxTriangles) or 768
+    local maxTriangles = (importedScene and importedScene.maxTriangles) or IMPORTED_TRIANGLE_HARD_CAP
 
     if not path then
-        importedScene = {
-            path = "objects",
-            maxTriangles = maxTriangles,
-            loaded = false,
-            triCount = 0,
-            meshVertsImage = nil,
-            meshUVImage = nil,
-            meshMatIdImage = nil,
-            meshTexSize = { 3, 1 },
-            materialIndexByName = {},
-            materialList = {},
-            materialTextures = {},
-            materialColors = {},
-        }
+        importedScene = newImportedSceneState("objects", maxTriangles)
+        governor.updateSceneEstimates(runtimeGovernor, importedScene)
         print("No OBJ files found in objects/")
         return
     end
 
     importedScene = buildImportedScene(path, maxTriangles)
+    governor.updateSceneEstimates(runtimeGovernor, importedScene)
     print("Selected runtime model:", path)
 end
 
 local function focusImportedScene()
     tracerSettings.sceneVariant = 3
-    camera.pos = { 0.0, 1.8, 7.5 }
-    camera.yaw = math.pi
-    camera.pitch = -0.08
+    local bounds = importedScene and importedScene.bounds or nil
+    local center = bounds and bounds.center or { 0.0, 1.2, -4.0 }
+    local size = bounds and bounds.size or { 7.0, 3.5, 1.0 }
+
+    local radius = math.max(
+        1.5,
+        0.5 * math.sqrt(size[1] * size[1] + size[2] * size[2] + size[3] * size[3])
+    )
+    local halfFov = math.max(0.18, camera.fov * 0.5)
+    local distance = radius / math.tan(halfFov)
+    distance = distance + radius * 0.85
+
+    camera.pos = {
+        center[1],
+        center[2] + size[2] * 0.08,
+        center[3] + distance,
+    }
+    lookCameraAt(center)
 end
 
 local function cycleSelectedModel(delta)
@@ -507,11 +788,16 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Input Capture and Pause State     ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Input Capture and Pause State     ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Input Capture and Pause State
+
+local closeDropdown
+local setPausePage
+local pausePages
 
 local function setInputCapture(captured)
     captureInput = captured
@@ -527,13 +813,15 @@ local function openPauseMenu()
     isPaused = true
     enableMouse = false
     love.mouse.setRelativeMode(false)
-    menuIndex = clampInt(menuIndex, 1, math.max(1, #menuRows > 0 and #menuRows or 1))
+    closeDropdown()
+    setPausePage(clampInt(pausePageIndex, 1, #pausePages))
 end
 
 local function closePauseMenu()
     isPaused = false
     enableMouse = true
     hoveredMenuIndex = 0
+    closeDropdown()
     love.mouse.setRelativeMode(true)
 end
 
@@ -549,17 +837,33 @@ local function cycleFPS(delta)
     fpsTarget = fpsOptions[currentIdx]
 end
 
+local function reloadImportedSceneBudget()
+    local hadPath = importedScene and importedScene.path and importedScene.path ~= ""
+    if hadPath or #modelBrowser.files > 0 then
+        loadSelectedModel()
+        resetAccum()
+    end
+end
+
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Pause Menu Definitions            ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Pause Menu Definitions            ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Pause Menu Definitions
 
 local menuDefinitions = {}
 
 local menuOrder = {}
+local isInteractiveMenuIndex
+
+pausePages = {
+    { sectionId = "section_render", title = "Render" },
+    { sectionId = "section_import", title = "Import" },
+    { sectionId = "section_governor", title = "Governor" },
+}
 
 local function registerMenuItem(def)
     menuDefinitions[def.id] = def
@@ -569,6 +873,145 @@ end
 local function getMenuDefByIndex(index)
     local id = menuOrder[index]
     return id and menuDefinitions[id] or nil
+end
+
+local function getPageStartIndex(pageIndex)
+    local page = pausePages[pageIndex]
+    if not page then
+        return 1
+    end
+
+    for i = 1, #menuOrder do
+        if menuOrder[i] == page.sectionId then
+            return i
+        end
+    end
+
+    return 1
+end
+
+local function getVisibleMenuIndices()
+    local startIndex = getPageStartIndex(pausePageIndex)
+    local endIndex = #menuOrder
+
+    for nextPage = pausePageIndex + 1, #pausePages do
+        local nextStart = getPageStartIndex(nextPage)
+        if nextStart > startIndex then
+            endIndex = nextStart - 1
+            break
+        end
+    end
+
+    local indices = {}
+    for i = startIndex, endIndex do
+        indices[#indices + 1] = i
+    end
+    return indices
+end
+
+closeDropdown = function()
+    dropdownState.open = false
+    dropdownState.menuIndex = 0
+    dropdownState.options = {}
+    dropdownState.hoveredOption = 0
+    dropdownState.scrollIndex = 1
+    dropdownState.visibleCount = 0
+end
+
+setPausePage = function(index)
+    pausePageIndex = clampInt(index, 1, #pausePages)
+    closeDropdown()
+
+    local visible = getVisibleMenuIndices()
+    for i = 1, #visible do
+        if isInteractiveMenuIndex(visible[i]) then
+            menuIndex = visible[i]
+            return
+        end
+    end
+
+    menuIndex = visible[1] or 1
+end
+
+local function buildMenuChoices(def)
+    if not def or not def.choices then
+        return {}
+    end
+
+    local options = def.choices()
+    if not options then
+        return {}
+    end
+
+    return options
+end
+
+local function clampDropdownState()
+    local optionCount = #dropdownState.options
+    if optionCount <= 0 then
+        dropdownState.hoveredOption = 0
+        dropdownState.scrollIndex = 1
+        dropdownState.visibleCount = 0
+        return
+    end
+
+    local maxVisible = math.max(1, dropdownState.maxVisible or 8)
+    local visibleCount = math.min(optionCount, maxVisible)
+    local maxScroll = math.max(1, optionCount - visibleCount + 1)
+
+    dropdownState.hoveredOption = clampInt(dropdownState.hoveredOption, 1, optionCount)
+    dropdownState.scrollIndex = clampInt(dropdownState.scrollIndex, 1, maxScroll)
+
+    if dropdownState.hoveredOption < dropdownState.scrollIndex then
+        dropdownState.scrollIndex = dropdownState.hoveredOption
+    elseif dropdownState.hoveredOption >= (dropdownState.scrollIndex + visibleCount) then
+        dropdownState.scrollIndex = dropdownState.hoveredOption - visibleCount + 1
+    end
+
+    dropdownState.visibleCount = visibleCount
+end
+
+local function openDropdownForIndex(index)
+    local def = getMenuDefByIndex(index)
+    if not def or not def.choices then
+        return
+    end
+
+    local options = buildMenuChoices(def)
+    if #options == 0 then
+        return
+    end
+
+    dropdownState.open = true
+    dropdownState.menuIndex = index
+    dropdownState.options = options
+    dropdownState.hoveredOption = def.getChoiceIndex and def.getChoiceIndex() or 1
+    dropdownState.scrollIndex = math.max(1, dropdownState.hoveredOption - math.floor((dropdownState.maxVisible or 8) * 0.5))
+    clampDropdownState()
+end
+
+local function chooseDropdownOption(optionIndex)
+    local def = getMenuDefByIndex(dropdownState.menuIndex)
+    if not def or not def.setChoiceIndex then
+        closeDropdown()
+        return
+    end
+
+    def.setChoiceIndex(optionIndex)
+    closeDropdown()
+end
+
+local function stepDropdownHover(delta)
+    if not dropdownState.open or delta == 0 or #dropdownState.options == 0 then
+        return
+    end
+
+    dropdownState.hoveredOption = clampInt(
+        dropdownState.hoveredOption + delta,
+        1,
+        #dropdownState.options
+    )
+    clampDropdownState()
 end
 
 local function getMenuLabelAndValue(index)
@@ -589,26 +1032,50 @@ end
 local function adjustMenuIndex(index, delta)
     local def = getMenuDefByIndex(index)
     if not def or not def.adjust or delta == 0 or def.kind == "section" then
+        if def and def.kind ~= "section" and def.choices and def.getChoiceIndex and def.setChoiceIndex and delta ~= 0 then
+            local choiceCount = #buildMenuChoices(def)
+            local nextIndex = clampInt(def.getChoiceIndex() + delta, 1, math.max(1, choiceCount))
+            def.setChoiceIndex(nextIndex)
+            closeDropdown()
+        end
         return
     end
     def.adjust(delta)
+    closeDropdown()
 end
 
 local function activateMenuIndex(index)
     local def = getMenuDefByIndex(index)
     if not def or not def.activate or def.kind == "section" then
+        if def and def.kind ~= "section" and def.choices then
+            if dropdownState.open and dropdownState.menuIndex == index then
+                closeDropdown()
+            else
+                openDropdownForIndex(index)
+            end
+        end
+        return
+    end
+    if def.choices then
+        if dropdownState.open and dropdownState.menuIndex == index then
+            closeDropdown()
+        else
+            openDropdownForIndex(index)
+        end
         return
     end
     def.activate()
+    closeDropdown()
 end
 
-local function isInteractiveMenuIndex(index)
+isInteractiveMenuIndex = function(index)
     local def = getMenuDefByIndex(index)
     return def and def.kind ~= "section"
 end
 
 local function stepMenuSelection(delta)
-    if #menuOrder == 0 then
+    local visible = getVisibleMenuIndices()
+    if #visible == 0 then
         return
     end
 
@@ -617,39 +1084,24 @@ local function stepMenuSelection(delta)
 
     repeat
         i = i + delta
-        if i < 1 then i = #menuOrder end
-        if i > #menuOrder then i = 1 end
+        local minVisible = visible[1]
+        local maxVisible = visible[#visible]
+        if i < minVisible then i = maxVisible end
+        if i > maxVisible then i = minVisible end
         if isInteractiveMenuIndex(i) then
             menuIndex = i
+            closeDropdown()
             return
         end
     until i == start
 end
 
---#region Session Menu Items
+--#region Render Menu Items
 
 registerMenuItem({
-    id = "section_resume",
+    id = "section_render",
     kind = "section",
-    title = "Session",
-})
-
-registerMenuItem({
-    id = "input_capture",
-    label = function()
-        return "Input Capture"
-    end,
-    value = function()
-        return captureInput and "Locked" or "Unlocked"
-    end,
-    adjust = function(delta)
-        if delta ~= 0 then
-            toggleInputCapture()
-        end
-    end,
-    activate = function()
-        toggleInputCapture()
-    end,
+    title = "Render",
 })
 
 registerMenuItem({
@@ -666,19 +1118,6 @@ registerMenuItem({
 })
 
 registerMenuItem({
-    id = "reset",
-    label = function()
-        return "Reset Accumulation"
-    end,
-    value = function()
-        return "Clear sampled history"
-    end,
-    activate = function()
-        resetAccum()
-    end,
-})
-
-registerMenuItem({
     id = "reset_defaults",
     label = function()
         return "Reset Defaults"
@@ -691,16 +1130,6 @@ registerMenuItem({
     end,
 })
 
---#endregion
-
---#region Render Menu Items
-
-registerMenuItem({
-    id = "section_render",
-    kind = "section",
-    title = "Render",
-})
-
 registerMenuItem({
     id = "quality",
     label = function()
@@ -708,6 +1137,19 @@ registerMenuItem({
     end,
     value = function()
         return qualityPresets[qualityIndex].name
+    end,
+    choices = function()
+        local choices = {}
+        for i = 1, #qualityPresets do
+            choices[i] = qualityPresets[i].name
+        end
+        return choices
+    end,
+    getChoiceIndex = function()
+        return qualityIndex
+    end,
+    setChoiceIndex = function(index)
+        applyPreset(index)
     end,
     adjust = function(delta)
         applyPreset(qualityIndex + delta)
@@ -725,6 +1167,7 @@ registerMenuItem({
     adjust = function(delta)
         local step = (math.abs(delta) >= 10) and limits.renderScale.fastStep or limits.renderScale.step
         renderScale = clamp(renderScale + delta * step, limits.renderScale.min, limits.renderScale.max)
+        governor.setRequestedRenderScale(runtimeGovernor, renderScale, limits.renderScale)
         rebuildAccum()
     end,
 })
@@ -737,21 +1180,52 @@ registerMenuItem({
     value = function()
         return fpsTarget == 0 and "Uncapped" or tostring(fpsTarget)
     end,
+    choices = function()
+        local choices = {}
+        for i = 1, #fpsOptions do
+            choices[i] = fpsOptions[i] == 0 and "Uncapped" or tostring(fpsOptions[i])
+        end
+        return choices
+    end,
+    getChoiceIndex = function()
+        for i = 1, #fpsOptions do
+            if fpsOptions[i] == fpsTarget then
+                return i
+            end
+        end
+        return 1
+    end,
+    setChoiceIndex = function(index)
+        fpsTarget = fpsOptions[clampInt(index, 1, #fpsOptions)]
+    end,
     adjust = function(delta)
         cycleFPS(delta)
     end,
 })
 
 registerMenuItem({
-    id = "render_mode",
+    id = "tracing_mode",
     label = function()
-        return "Tracer Mode"
+        return "Tracing Mode"
     end,
     value = function()
-        return renderModes[tracerSettings.modeIndex].name
+        return tracingModes[tracerSettings.tracingModeIndex].name
+    end,
+    choices = function()
+        local choices = {}
+        for i = 1, #tracingModes do
+            choices[i] = tracingModes[i].name
+        end
+        return choices
+    end,
+    getChoiceIndex = function()
+        return tracerSettings.tracingModeIndex
+    end,
+    setChoiceIndex = function(index)
+        applyTracingMode(index)
     end,
     adjust = function(delta)
-        applyRenderMode(tracerSettings.modeIndex + delta)
+        applyTracingMode(tracerSettings.tracingModeIndex + delta)
     end,
 })
 
@@ -763,6 +1237,27 @@ registerMenuItem({
     value = function()
         return sceneNames[tracerSettings.sceneVariant] or ("Scene " .. tostring(tracerSettings.sceneVariant))
     end,
+    choices = function()
+        local choices = {}
+        for i = limits.scene.min, limits.scene.max do
+            choices[#choices + 1] = sceneNames[i] or ("Scene " .. tostring(i))
+        end
+        return choices
+    end,
+    getChoiceIndex = function()
+        return tracerSettings.sceneVariant - limits.scene.min + 1
+    end,
+    setChoiceIndex = function(index)
+        tracerSettings.sceneVariant = clampInt(
+            limits.scene.min + (index - 1),
+            limits.scene.min,
+            limits.scene.max
+        )
+        if tracerSettings.sceneVariant == 3 then
+            focusImportedScene()
+        end
+        resetAccum()
+    end,
     adjust = function(delta)
         local step = (math.abs(delta) >= 10) and limits.scene.fastStep or limits.scene.step
         tracerSettings.sceneVariant = clampInt(
@@ -772,50 +1267,9 @@ registerMenuItem({
         )
 
         if tracerSettings.sceneVariant == 3 then
-            camera.pos = { 0.0, 1.8, 7.5 }
-            camera.yaw = math.pi
-            camera.pitch = -0.08
+            focusImportedScene()
         end
 
-        resetAccum()
-    end,
-})
-
-registerMenuItem({
-    id = "runtime_model",
-    label = function()
-        return "Runtime Model"
-    end,
-    value = function()
-        local selected = getSelectedModelPath()
-        return selected and basename(selected) or "No OBJ files found"
-    end,
-    adjust = function(delta)
-        if delta > 0 then
-            cycleSelectedModel(1)
-        elseif delta < 0 then
-            cycleSelectedModel(-1)
-        end
-    end,
-    activate = function()
-        scanObjectsFolder()
-        loadSelectedModel()
-        focusImportedScene()
-        resetAccum()
-    end,
-})
-
-registerMenuItem({
-    id = "refresh_models",
-    label = function()
-        return "Refresh Models"
-    end,
-    value = function()
-        return tostring(#modelBrowser.files) .. " found"
-    end,
-    activate = function()
-        scanObjectsFolder()
-        loadSelectedModel()
         resetAccum()
     end,
 })
@@ -898,14 +1352,286 @@ registerMenuItem({
     end,
 })
 
---#endregion
-
---#region Application Menu Items
+registerMenuItem({
+    id = "quit",
+    label = function()
+        return "Quit"
+    end,
+    value = function()
+        return "Exit application"
+    end,
+    activate = function()
+        love.event.quit()
+    end,
+})
 
 registerMenuItem({
-    id = "section_app",
+    id = "section_import",
     kind = "section",
-    title = "Application",
+    title = "Import",
+})
+
+registerMenuItem({
+    id = "resume",
+    label = function()
+        return "Resume"
+    end,
+    value = function()
+        return "Return to scene"
+    end,
+    activate = function()
+        closePauseMenu()
+    end,
+})
+
+registerMenuItem({
+    id = "reset_defaults",
+    label = function()
+        return "Reset Defaults"
+    end,
+    value = function()
+        return "Restore camera and settings"
+    end,
+    activate = function()
+        restoreDefaults()
+    end,
+})
+
+registerMenuItem({
+    id = "runtime_model",
+    label = function()
+        return "Runtime Model"
+    end,
+    value = function()
+        local selected = getSelectedModelPath()
+        return selected and basename(selected) or "No OBJ files found"
+    end,
+    choices = function()
+        local choices = {}
+        for i = 1, #modelBrowser.files do
+            choices[i] = basename(modelBrowser.files[i])
+        end
+        return choices
+    end,
+    getChoiceIndex = function()
+        return clampInt(modelBrowser.selectedIndex, 1, math.max(1, #modelBrowser.files))
+    end,
+    setChoiceIndex = function(index)
+        if #modelBrowser.files == 0 then
+            return
+        end
+        modelBrowser.selectedIndex = clampInt(index, 1, #modelBrowser.files)
+        loadSelectedModel()
+        focusImportedScene()
+        resetAccum()
+    end,
+    adjust = function(delta)
+        if delta > 0 then
+            cycleSelectedModel(1)
+        elseif delta < 0 then
+            cycleSelectedModel(-1)
+        end
+    end,
+    activate = function()
+        scanObjectsFolder()
+        loadSelectedModel()
+        focusImportedScene()
+        resetAccum()
+    end,
+})
+
+registerMenuItem({
+    id = "refresh_models",
+    label = function()
+        return "Refresh Models"
+    end,
+    value = function()
+        return tostring(#modelBrowser.files) .. " found"
+    end,
+    activate = function()
+        scanObjectsFolder()
+        loadSelectedModel()
+        resetAccum()
+    end,
+})
+
+registerMenuItem({
+    id = "quit",
+    label = function()
+        return "Quit"
+    end,
+    value = function()
+        return "Exit application"
+    end,
+    activate = function()
+        love.event.quit()
+    end,
+})
+
+--#endregion
+
+--#region Governor Menu Items
+
+registerMenuItem({
+    id = "section_governor",
+    kind = "section",
+    title = "Governor",
+})
+
+registerMenuItem({
+    id = "resume",
+    label = function()
+        return "Resume"
+    end,
+    value = function()
+        return "Return to scene"
+    end,
+    activate = function()
+        closePauseMenu()
+    end,
+})
+
+registerMenuItem({
+    id = "reset_defaults",
+    label = function()
+        return "Reset Defaults"
+    end,
+    value = function()
+        return "Restore camera and settings"
+    end,
+    activate = function()
+        restoreDefaults()
+    end,
+})
+
+registerMenuItem({
+    id = "governor_enabled",
+    label = function()
+        return "Adaptive Governor"
+    end,
+    value = function()
+        return formatBool(runtimeGovernor.enabled)
+    end,
+    adjust = function(delta)
+        if delta ~= 0 then
+            runtimeGovernor.enabled = not runtimeGovernor.enabled
+        end
+    end,
+    activate = function()
+        runtimeGovernor.enabled = not runtimeGovernor.enabled
+    end,
+})
+
+registerMenuItem({
+    id = "governor_min_fps",
+    label = function()
+        return "Minimum FPS"
+    end,
+    value = function()
+        return tostring(runtimeGovernor.minimumFPS)
+    end,
+    adjust = function(delta)
+        governor.adjustMinimumFPS(runtimeGovernor, delta)
+    end,
+})
+
+registerMenuItem({
+    id = "governor_frame_budget",
+    label = function()
+        return "Max Seconds/Frame"
+    end,
+    value = function()
+        return string.format("%.3f", runtimeGovernor.maxSecondsPerFrame or 0)
+    end,
+    adjust = function(delta)
+        governor.adjustMaxSecondsPerFrame(runtimeGovernor, delta)
+    end,
+})
+
+registerMenuItem({
+    id = "governor_dummy_on_move",
+    label = function()
+        return "Dummy Render On Move"
+    end,
+    value = function()
+        return formatBool(runtimeGovernor.dummyRenderOnMove)
+    end,
+    adjust = function(delta)
+        if delta ~= 0 then
+            runtimeGovernor.dummyRenderOnMove = not runtimeGovernor.dummyRenderOnMove
+        end
+    end,
+    activate = function()
+        runtimeGovernor.dummyRenderOnMove = not runtimeGovernor.dummyRenderOnMove
+    end,
+})
+
+registerMenuItem({
+    id = "governor_limit_ram",
+    label = function()
+        return "Limit RAM"
+    end,
+    value = function()
+        return formatBool(runtimeGovernor.limitRAM)
+    end,
+    adjust = function(delta)
+        if delta ~= 0 then
+            runtimeGovernor.limitRAM = not runtimeGovernor.limitRAM
+            reloadImportedSceneBudget()
+        end
+    end,
+    activate = function()
+        runtimeGovernor.limitRAM = not runtimeGovernor.limitRAM
+        reloadImportedSceneBudget()
+    end,
+})
+
+registerMenuItem({
+    id = "governor_ram_limit",
+    label = function()
+        return "RAM Limit"
+    end,
+    value = function()
+        return tostring(runtimeGovernor.ramLimitMB) .. " MiB"
+    end,
+    adjust = function(delta)
+        governor.adjustRamLimit(runtimeGovernor, delta)
+        reloadImportedSceneBudget()
+    end,
+})
+
+registerMenuItem({
+    id = "governor_limit_vram",
+    label = function()
+        return "Limit VRAM"
+    end,
+    value = function()
+        return formatBool(runtimeGovernor.limitVRAM)
+    end,
+    adjust = function(delta)
+        if delta ~= 0 then
+            runtimeGovernor.limitVRAM = not runtimeGovernor.limitVRAM
+            reloadImportedSceneBudget()
+        end
+    end,
+    activate = function()
+        runtimeGovernor.limitVRAM = not runtimeGovernor.limitVRAM
+        reloadImportedSceneBudget()
+    end,
+})
+
+registerMenuItem({
+    id = "governor_vram_limit",
+    label = function()
+        return "VRAM Limit"
+    end,
+    value = function()
+        return tostring(runtimeGovernor.vramLimitMB) .. " MiB"
+    end,
+    adjust = function(delta)
+        governor.adjustVRamLimit(runtimeGovernor, delta)
+        reloadImportedSceneBudget()
+    end,
 })
 
 registerMenuItem({
@@ -925,9 +1651,10 @@ registerMenuItem({
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Pause Menu Layout and Hit Testing ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Pause Menu Layout and Hit Testing ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Pause Menu Layout and Hit Testing
 
@@ -937,19 +1664,34 @@ local function rebuildMenuInteractionTables(layout)
     menuPositionsY = {}
     menuItemCallbacks = {}
     lastMenuLayout = layout
+    pauseTabs = {}
 
     local interactiveLeft = layout.panelX + 18
     local interactiveRight = layout.panelX + layout.panelW - 18
     menuPositionsX[1] = { min = interactiveLeft, max = interactiveRight }
 
-    local rowIndex = 0
-    local y = layout.firstRowY
+    local tabX = math.floor(layout.panelX + ((layout.panelW / #pausePages ) + 0.5))
+    local tabY = layout.panelY + 24
+    for i = 1, #pausePages do
+        local title = pausePages[i].title
+        local tabW = fontSmall:getWidth(title) + 28
+        pauseTabs[i] = {
+            x1 = tabX,
+            x2 = tabX + tabW,
+            y1 = tabY,
+            y2 = tabY + 24,
+            index = i,
+        }
+        tabX = tabX + tabW + 8
+    end
 
-    for i = 1, #menuOrder do
+    local y = layout.firstRowY
+    local visible = getVisibleMenuIndices()
+
+    for _, i in ipairs(visible) do
         local def = getMenuDefByIndex(i)
 
         if def and def.kind == "section" then
-            rowIndex = rowIndex + 1
             local top = y - 2
             local bottom = top + 30
             menuRows[i] = {
@@ -962,7 +1704,6 @@ local function rebuildMenuInteractionTables(layout)
             }
             y = y + layout.sectionGap
         else
-            rowIndex = rowIndex + 1
             local top = y - 4
             local bottom = top + layout.rowH
 
@@ -1005,11 +1746,42 @@ local function getMenuCellAt(mx, my)
     return nil
 end
 
+local function getPauseTabAt(mx, my)
+    for i = 1, #pauseTabs do
+        local tab = pauseTabs[i]
+        if mx >= tab.x1 and mx <= tab.x2 and my >= tab.y1 and my <= tab.y2 then
+            return tab.index
+        end
+    end
+    return nil
+end
+
+local function getDropdownOptionAt(mx, my)
+    if not dropdownState.open then
+        return nil
+    end
+
+    local startIndex = dropdownState.scrollIndex or 1
+    local visibleCount = dropdownState.visibleCount or math.min(#dropdownState.options, dropdownState.maxVisible or 8)
+    local endIndex = math.min(#dropdownState.options, startIndex + visibleCount - 1)
+
+    for i = startIndex, endIndex do
+        local top = dropdownState.y + (i - startIndex) * dropdownState.rowH
+        local bottom = top + dropdownState.rowH
+        if mx >= dropdownState.x and mx <= (dropdownState.x + dropdownState.w) and my >= top and my <= bottom then
+            return i
+        end
+    end
+
+    return nil
+end
+
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Shared UI Drawing Helpers         ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Shared UI Drawing Helpers         ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Shared UI Drawing Helpers
 
@@ -1054,9 +1826,10 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ LÖVE Runtime and Input Callbacks  ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ LÖVE Runtime and Input Callbacks  ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region LÖVE Runtime and Input Callbacks
 
@@ -1107,29 +1880,43 @@ function love.run()
             love.graphics.present()
         end
 
+        if not isPaused then
+            local elapsed = (love.timer and love.timer.getTime() or 0) - frameStart
+            local nextScale, changed = governor.stepTowardsFrameBudget(
+                runtimeGovernor,
+                elapsed,
+                renderScale,
+                limits.renderScale
+            )
+            if changed then
+                renderScale = nextScale
+                rebuildAccum()
+            end
+        end
+
         if love.timer and fpsTarget > 0 then
             local elapsed = love.timer.getTime() - frameStart
             local target = 1 / fpsTarget
             if elapsed < target then
-                love.timer.sleep(target - elapsed)
+                love.timer.sleep(target - (elapsed * 1.001)) -- Quick and dirty attempt to account for over-sleeping
             end
         end
     end
 end
 
 function love.load()
-    love.window.setTitle("Path Traced SDF")
+    love.window.setTitle("Love2D RayTracing Example")
 
     fontSmall = love.graphics.newFont(12)
     fontBody = love.graphics.newFont(16)
-    fontTitle = love.graphics.newFont(26)
+    fontTitle = love.graphics.newFont(20)
 
     love.graphics.setFont(fontBody)
     love.mouse.setRelativeMode(true)
 
     shader = love.graphics.newShader("shader.glsl")
     rebuildAccum()
-    applyRenderMode(tracerSettings.modeIndex)
+    applyTracingMode(tracerSettings.tracingModeIndex)
 
     scanObjectsFolder()
     loadSelectedModel()
@@ -1156,11 +1943,25 @@ function love.mousemoved(x, y, dx, dy)
             -math.pi / 2 + 0.001,
             math.min(math.pi / 2 - 0.001, camera.pitch - dy * 0.005)
         )
-        resetAccum()
+        governor.noteMotion(runtimeGovernor, love.timer and love.timer.getTime() or 0)
+        resetAccum(true)
         return
     end
 
     if isPaused and love.window.hasMouseFocus() then
+        local hoveredOption = getDropdownOptionAt(x, y)
+        if hoveredOption then
+            dropdownState.hoveredOption = hoveredOption
+            hoveredMenuIndex = dropdownState.menuIndex
+            return
+        end
+
+        local hoveredTab = getPauseTabAt(x, y)
+        if hoveredTab then
+            hoveredMenuIndex = 0
+            return
+        end
+
         local _, _, itemIndex = getMenuCellAt(x, y)
         hoveredMenuIndex = itemIndex or 0
         if itemIndex then
@@ -1172,11 +1973,25 @@ end
 function love.mousepressed(x, y, button)
     if isPaused then
         if button == 1 then
+            local dropdownOption = getDropdownOptionAt(x, y)
+            if dropdownOption then
+                chooseDropdownOption(dropdownOption)
+                return
+            end
+
+            local tabIndex = getPauseTabAt(x, y)
+            if tabIndex then
+                setPausePage(tabIndex)
+                return
+            end
+
             local xIndex, yIndex, itemIndex = getMenuCellAt(x, y)
             if xIndex and yIndex and menuItemCallbacks[xIndex] and menuItemCallbacks[xIndex][yIndex] then
                 menuItemCallbacks[xIndex][yIndex]()
             elseif itemIndex then
                 menuIndex = itemIndex
+            else
+                closeDropdown()
             end
         end
         return
@@ -1188,6 +2003,11 @@ end
 
 function love.wheelmoved(x, y)
     if isPaused then
+        if dropdownState.open then
+            stepDropdownHover(y < 0 and 1 or (y > 0 and -1 or 0))
+            return
+        end
+
         menuIndex = clampInt(menuIndex, 1, #menuOrder)
         adjustMenuIndex(menuIndex, y > 0 and 1 or (y < 0 and -1 or 0))
         return
@@ -1206,7 +2026,9 @@ end
 
 function love.keypressed(key)
     if key == "escape" then
-        if isPaused then
+        if isPaused and dropdownState.open then
+            closeDropdown()
+        elseif isPaused then
             closePauseMenu()
         else
             openPauseMenu()
@@ -1215,7 +2037,17 @@ function love.keypressed(key)
     end
 
     if isPaused then
-        if key == "up" or key == "w" then
+        if key == "q" then
+            setPausePage(pausePageIndex - 1)
+        elseif key == "e" then
+            setPausePage(pausePageIndex + 1)
+        elseif dropdownState.open and (key == "up" or key == "w") then
+            stepDropdownHover(-1)
+        elseif dropdownState.open and (key == "down" or key == "s") then
+            stepDropdownHover(1)
+        elseif dropdownState.open and (key == "return" or key == "kpenter" or key == "space") then
+            chooseDropdownOption(dropdownState.hoveredOption)
+        elseif key == "up" or key == "w" then
             stepMenuSelection(-1)
         elseif key == "down" or key == "s" then
             stepMenuSelection(1)
@@ -1258,7 +2090,7 @@ function love.keypressed(key)
     elseif key == "f1" then
         uiState.compactHud = not uiState.compactHud
     else
-        print(tostring(key))
+        -- print(tostring(key))
         keysDown[key] = true
     end
 end
@@ -1315,7 +2147,8 @@ function love.update(dt)
         if dot(move, move) > 0 then
             move = norm(move)
             camera.pos = add(camera.pos, mul(move, moveSpeed * dt))
-            resetAccum()
+            governor.noteMotion(runtimeGovernor, love.timer and love.timer.getTime() or 0)
+            resetAccum(true)
         end
     end
 end
@@ -1324,14 +2157,15 @@ end
 
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ UI Panels and Overlay Rendering   ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ UI Panels and Overlay Rendering   ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region UI Panels and Overlay Rendering
 
 local function getPauseMenuMetrics()
-    local headerH = 88
+    local headerH = 54
     local footerH = 82
     local rowH = 38
     local rowGap = 44
@@ -1341,7 +2175,8 @@ local function getPauseMenuMetrics()
 
     local contentH = 0
 
-    for i = 1, #menuOrder do
+    local visible = getVisibleMenuIndices()
+    for _, i in ipairs(visible) do
         local def = getMenuDefByIndex(i)
         if def and def.kind == "section" then
             contentH = contentH + sectionGap
@@ -1391,18 +2226,27 @@ local function drawPauseMenu()
     drawRoundedPanel(m.panelX, m.panelY, m.panelW, m.panelH, 18, 0.94, 0.12)
 
     love.graphics.setFont(fontTitle)
-    love.graphics.setColor(1, 1, 1, 0.96)
-    love.graphics.print("Paused", m.panelX + 24, m.panelY + 18)
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.print("LOVE2D SDF RayTracer", m.panelX + 24, m.panelY + 14)
 
     love.graphics.setFont(fontSmall)
-    love.graphics.setColor(1, 1, 1, 0.58)
-    love.graphics.print("Realtime Path Tracer Controls", m.panelX + 26, m.panelY + 54)
+    for i = 1, #pauseTabs do
+        local tab = pauseTabs[i]
+        local active = (i == pausePageIndex)
+        love.graphics.setColor(1, 1, 1, active and 0.14 or 0.06)
+        love.graphics.rectangle("fill", tab.x1, tab.y1, tab.x2 - tab.x1, tab.y2 - tab.y1, 8, 8)
+        love.graphics.setColor(1, 1, 1, active and 0.16 or 0.08)
+        love.graphics.rectangle("line", tab.x1, tab.y1, tab.x2 - tab.x1, tab.y2 - tab.y1, 8, 8)
+        love.graphics.setColor(1, 1, 1, active and 0.96 or 0.72)
+        love.graphics.print(pausePages[i].title, tab.x1 + 12, tab.y1 + 4)
+    end
 
     local contentTop = m.firstRowY - 6
     local contentBottom = m.panelY + m.panelH - m.footerH - 12
     love.graphics.setScissor(m.panelX + 8, contentTop, m.panelW - 16, contentBottom - contentTop)
 
-    for i = 1, #menuOrder do
+    local visible = getVisibleMenuIndices()
+    for _, i in ipairs(visible) do
         local def = getMenuDefByIndex(i)
         local row = menuRows[i]
 
@@ -1454,6 +2298,57 @@ local function drawPauseMenu()
 
     love.graphics.setScissor()
 
+    if dropdownState.open and menuRows[dropdownState.menuIndex] then
+        local row = menuRows[dropdownState.menuIndex]
+        clampDropdownState()
+
+        dropdownState.w = math.min(320, m.panelW - 56)
+        dropdownState.rowH = 28
+
+        local drawCount = dropdownState.visibleCount or math.min(#dropdownState.options, dropdownState.maxVisible or 8)
+        local dropdownH = drawCount * dropdownState.rowH
+        local preferredX = m.panelX + m.panelW - dropdownState.w - 28
+        local minY = m.panelY + 84
+        local maxY = height - dropdownH - 20
+
+        dropdownState.x = clamp(preferredX, m.panelX + 28, width - dropdownState.w - 16)
+        dropdownState.y = row.y2 + 6
+        if dropdownState.y + dropdownH > (m.panelY + m.panelH - m.footerH - 6) then
+            dropdownState.y = row.y1 - dropdownH - 6
+        end
+        dropdownState.y = clamp(dropdownState.y, minY, math.max(minY, maxY))
+
+        love.graphics.setColor(0.06, 0.06, 0.09, 0.98)
+        love.graphics.rectangle("fill", dropdownState.x, dropdownState.y, dropdownState.w, dropdownH, 10, 10)
+        love.graphics.setColor(1, 1, 1, 0.12)
+        love.graphics.rectangle("line", dropdownState.x, dropdownState.y, dropdownState.w, dropdownH, 10, 10)
+
+        local startIndex = dropdownState.scrollIndex or 1
+        local endIndex = math.min(#dropdownState.options, startIndex + drawCount - 1)
+
+        for optionIndex = startIndex, endIndex do
+            local optionY = dropdownState.y + (optionIndex - startIndex) * dropdownState.rowH
+            local hovered = optionIndex == dropdownState.hoveredOption
+            if hovered then
+                love.graphics.setColor(1, 1, 1, 0.10)
+                love.graphics.rectangle("fill", dropdownState.x + 4, optionY + 2, dropdownState.w - 8, dropdownState.rowH - 4, 8, 8)
+            end
+
+            love.graphics.setColor(1, 1, 1, hovered and 0.98 or 0.82)
+            love.graphics.print(tostring(dropdownState.options[optionIndex]), dropdownState.x + 12, optionY + 5)
+        end
+
+        if startIndex > 1 then
+            love.graphics.setColor(1, 1, 1, 0.45)
+            love.graphics.print("...", dropdownState.x + dropdownState.w - 26, dropdownState.y + 2)
+        end
+
+        if endIndex < #dropdownState.options then
+            love.graphics.setColor(1, 1, 1, 0.45)
+            love.graphics.print("...", dropdownState.x + dropdownState.w - 26, dropdownState.y + dropdownH - 18)
+        end
+    end
+
     love.graphics.setColor(1, 1, 1, 0.08)
     love.graphics.rectangle("fill", m.panelX + 1, m.panelY + m.panelH - m.footerH, m.panelW - 2, m.footerH - 1)
 
@@ -1479,17 +2374,25 @@ local function drawHud()
         { "Preset",  qualityPresets[qualityIndex].name },
         { "Scale",   string.format("%.2f", renderScale) },
         { "Target",  fpsTarget == 0 and "Uncapped" or tostring(fpsTarget) },
+        { "Tracing", tracingModes[tracerSettings.tracingModeIndex].name },
         { "Scene",   sceneNames[tracerSettings.sceneVariant] or tostring(tracerSettings.sceneVariant) },
         { "Bounces", tostring(tracerSettings.maxBounces) },
         { "Steps",   tostring(tracerSettings.maxSteps) },
         { "Shadows", formatBool(tracerSettings.shadows) },
         { "Reflect", formatBool(tracerSettings.reflections) },
+        { "Gov FPS", tostring(runtimeGovernor.minimumFPS) },
+        { "Gov Sec", string.format("%.3f", runtimeGovernor.maxSecondsPerFrame or 0) },
+        { "Dummy", formatBool(governor.shouldUseDummyRender(runtimeGovernor, love.timer and love.timer.getTime() or 0)) },
     }
 
     if tracerSettings.sceneVariant == 3 then
         local selected = getSelectedModelPath()
         lines[#lines + 1] = { "Model", selected and basename(selected) or "None" }
         lines[#lines + 1] = { "OBJ Tris", tostring(importedScene.triCount or 0) }
+        lines[#lines + 1] = { "Src Tris", tostring(importedScene.sourceTriCount or 0) }
+        lines[#lines + 1] = { "Import", tostring(importedScene.importMode or "none") }
+        lines[#lines + 1] = { "BVH", tostring(importedScene.bvhNodeCount or 0) }
+        lines[#lines + 1] = { "Scene VRAM", formatMiB(importedScene.estimatedVRAMBytes or 0) }
         lines[#lines + 1] = { "OBJ Files", tostring(#modelBrowser.files) }
     end
 
@@ -1501,11 +2404,11 @@ local function drawHud()
 
         love.graphics.setFont(fontSmall)
         love.graphics.setColor(1, 1, 1, 0.55)
-        love.graphics.print("PATH TRACER", x + 14, y + 10)
+        love.graphics.print("RENDERER", x + 14, y + 10)
 
         love.graphics.setFont(fontBody)
         love.graphics.setColor(1, 1, 1, 0.95)
-        love.graphics.print(renderModes[tracerSettings.modeIndex].name, x + 14, y + 28)
+        love.graphics.print(tracingModes[tracerSettings.tracingModeIndex].name, x + 14, y + 28)
 
         love.graphics.setFont(fontSmall)
         love.graphics.setColor(1, 1, 1, 0.80)
@@ -1525,11 +2428,11 @@ local function drawHud()
 
     love.graphics.setFont(fontSmall)
     love.graphics.setColor(1, 1, 1, 0.55)
-    love.graphics.print("PATH TRACER", x + 14, y + 10)
+    love.graphics.print("RENDERER", x + 14, y + 10)
 
     love.graphics.setFont(fontBody)
     love.graphics.setColor(1, 1, 1, 0.95)
-    love.graphics.print(renderModes[tracerSettings.modeIndex].name, x + 14, y + 26)
+    love.graphics.print(tracingModes[tracerSettings.tracingModeIndex].name, x + 14, y + 26)
 
     local lineY = y + headerH
     love.graphics.setFont(fontSmall)
@@ -1542,7 +2445,7 @@ local function drawHud()
     end
 end
 
-local function drawBottomHintBar()
+local function drawBottomHintBarLegacy()
     local barH = 42
     love.graphics.setColor(0, 0, 0, 0.34)
     love.graphics.rectangle("fill", 0, height - barH, width, barH)
@@ -1555,35 +2458,78 @@ local function drawBottomHintBar()
     love.graphics.printf(text, 14, height - 28, width - 28, "left")
 end
 
+local function drawBottomHintBarClean()
+    local barH = 42
+    love.graphics.setColor(0, 0, 0, 0.34)
+    love.graphics.rectangle("fill", 0, height - barH, width, barH)
+
+    love.graphics.setFont(fontSmall)
+    love.graphics.setColor(1, 1, 1, 0.78)
+
+    local text =
+    "Esc Pause   |   Mouse Wheel Change Preset   |   Q / E Cycle Models   |   F5 Refresh Objects   |   R Reset Accumulation   |   Tab Toggle HUD   |   F1 Compact HUD   |   Caps Lock Toggle Input   |   W / A / S / D Move   |   Space Ascend   |   Left Ctrl Descend   |   Mouse Look   |   Left Shift Faster"
+    love.graphics.printf(text, 14, height - 28, width - 28, "left")
+end
+
+local function renderFullscreenPass(targetCanvas, historyTex, cacheTex, overrides)
+    sendFrameUniforms(1, historyTex, cacheTex, overrides)
+    targetCanvas:renderTo(function()
+        love.graphics.clear(0, 0, 0, 1)
+        love.graphics.setShader(shader)
+        love.graphics.setBlendMode("alpha", "premultiplied")
+        love.graphics.draw(historyTex or getFallbackFloatImage(), 0, 0)
+        love.graphics.setShader()
+    end)
+end
+
+local function drawCanvasToScreen(canvas)
+    love.graphics.setShader()
+    love.graphics.setBlendMode("alpha", "alphamultiply")
+    love.graphics.setColor(1, 1, 1, 1)
+    love.graphics.draw(canvas, 0, 0, 0, width / renderWidth, height / renderHeight)
+end
+
+local function renderDummyPreviewFrame()
+    local fallback = getFallbackFloatImage()
+    renderFullscreenPass(accumDst, fallback, fallback, {
+        frameIndex = 0,
+        tracingMode = tracingModes[1].shaderMode,
+        maxBounces = tracingModes[1].defaultBounces,
+        maxSteps = tracingModes[1].defaultSteps,
+        enableReflections = false,
+    })
+    drawCanvasToScreen(accumDst)
+    syncPreviousCameraToCurrent()
+end
+
 --#endregion
 
--- ╓───────────────────────────────────╖
--- ║ Final Draw Call to LÖVE for GPU   ║
--- ╙───────────────────────────────────╜
+--[[ ╓───────────────────────────────────╖
+     ║ Final Draw Call to LÖVE for GPU   ║
+     ╙───────────────────────────────────╜
+]]
 
 --#region Final Draw Call to LÖVE for GPU
 
 function love.draw()
-    if not isPaused then
-        shader:send("iFrame", currentFrame)
-        shader:send("iResolution", { renderWidth, renderHeight })
-        shader:send("camPos", camera.pos)
-        shader:send("yaw", camera.yaw)
-        shader:send("pitch", camera.pitch)
-        shader:send("tex", accumSrc)
+    local dummyRenderActive = (not isPaused) and governor.shouldUseDummyRender(
+        runtimeGovernor,
+        love.timer and love.timer.getTime() or 0
+    )
 
-        shader:send("uMaxBounces", tracerSettings.maxBounces)
-        shader:send("uMaxSteps", tracerSettings.maxSteps)
-        shader:send("uEnableShadows", boolToInt(tracerSettings.shadows))
-        shader:send("uEnableReflections", boolToInt(tracerSettings.reflections))
-        shader:send("uSceneVariant", tracerSettings.sceneVariant)
-        shader:send("uMeshTriCount", importedScene.triCount or 0)
-        shader:send("uMeshTexSize", importedScene.meshTexSize or { 3, 1 })
+    if not isPaused and dummyRenderActive then
+        renderDummyPreviewFrame()
+    elseif not isPaused then
+        sendFrameUniforms(0, radianceSrc, radianceSrc)
+        radianceDst:renderTo(function()
+            love.graphics.clear(0, 0, 0, 0)
+            love.graphics.setShader(shader)
+            love.graphics.setBlendMode("alpha", "premultiplied")
+            love.graphics.draw(radianceSrc, 0, 0)
+            love.graphics.setShader()
+        end)
 
-        if importedScene.meshVertsImage then
-            shader:send("meshVerts", importedScene.meshVertsImage)
-        end
-
+        sendFrameUniforms(1, accumSrc, radianceDst)
         accumDst:renderTo(function()
             love.graphics.clear(0, 0, 0, 1)
             love.graphics.setShader(shader)
@@ -1592,28 +2538,25 @@ function love.draw()
             love.graphics.setShader()
         end)
 
-        love.graphics.setShader()
-        love.graphics.setBlendMode("alpha", "alphamultiply")
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.draw(accumDst, 0, 0, 0, width / renderWidth, height / renderHeight)
+        drawCanvasToScreen(accumDst)
 
-        swap()
+        swapAccum()
+        swapRadianceCache()
+        syncPreviousCameraToCurrent()
         currentFrame = currentFrame + 1
     else
-        love.graphics.setShader()
-        love.graphics.setBlendMode("alpha", "alphamultiply")
-        love.graphics.setColor(1, 1, 1, 1)
-
         local pausedCanvas = accumSrc or accumDst
         if pausedCanvas then
-            love.graphics.draw(pausedCanvas, 0, 0, 0, width / renderWidth, height / renderHeight)
+            drawCanvasToScreen(pausedCanvas)
         end
 
-        drawPauseMenu()
+        if isPaused then
+            drawPauseMenu()
+        end
     end
 
     drawHud()
-    drawBottomHintBar()
+    drawBottomHintBarClean()
 end
 
 --#endregion

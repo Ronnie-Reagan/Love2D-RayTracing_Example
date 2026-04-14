@@ -1,3 +1,5 @@
 build/
 objects/*
+!objects/cottage.obj
 build.lua
+.github/
