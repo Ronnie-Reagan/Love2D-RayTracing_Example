@@ -149,7 +149,6 @@ local renderWidth = math.max(1, math.floor(width * renderScale))
 local renderHeight = math.max(1, math.floor(height * renderScale))
 
 local accumA, accumB, accumSrc, accumDst
-local radianceA, radianceB, radianceSrc, radianceDst
 local shader
 local currentFrame = 0
 local keysDown = {}
@@ -188,13 +187,6 @@ local uiState = {
 }
 
 local camera = {
-    pos   = { defaults.camera.pos[1], defaults.camera.pos[2], defaults.camera.pos[3] },
-    yaw   = defaults.camera.yaw,
-    pitch = defaults.camera.pitch,
-    fov   = defaults.camera.fov,
-}
-
-local previousCamera = {
     pos   = { defaults.camera.pos[1], defaults.camera.pos[2], defaults.camera.pos[3] },
     yaw   = defaults.camera.yaw,
     pitch = defaults.camera.pitch,
@@ -249,17 +241,12 @@ end
 local copyVec3 = vec3.copy
 
 local function atan2(y, x)
+---@diagnostic disable: deprecated
     if math.atan2 then
         return math.atan2(y, x)
     end
+---@diagnostic enable: deprecated
     return math.atan(y, x)
-end
-
-local function syncPreviousCameraToCurrent()
-    previousCamera.pos = copyVec3(camera.pos)
-    previousCamera.yaw = camera.yaw
-    previousCamera.pitch = camera.pitch
-    previousCamera.fov = camera.fov
 end
 
 local function lookCameraAt(target)
@@ -285,10 +272,6 @@ local function swapAccum()
     accumSrc, accumDst = accumDst, accumSrc
 end
 
-local function swapRadianceCache()
-    radianceSrc, radianceDst = radianceDst, radianceSrc
-end
-
 local function clearCanvas(canvas, r, g, b, a)
     if not canvas then
         return
@@ -304,14 +287,8 @@ local function clearAccumHistory()
     clearCanvas(accumB, 0, 0, 0, 1)
 end
 
-local function clearLightingCache()
-    clearCanvas(radianceA, 0, 0, 0, 0)
-    clearCanvas(radianceB, 0, 0, 0, 0)
-end
-
 local function clearAll()
     clearAccumHistory()
-    clearLightingCache()
 end
 
 local function configureCanvas(canvas, minFilter, magFilter)
@@ -320,13 +297,9 @@ local function configureCanvas(canvas, minFilter, magFilter)
     return canvas
 end
 
-local function resetAccum(preserveLightingCache)
+local function resetAccum()
     currentFrame = 0
     clearAccumHistory()
-
-    if not preserveLightingCache then
-        clearLightingCache()
-    end
 end
 
 local function rebuildAccum()
@@ -337,18 +310,11 @@ local function rebuildAccum()
 
     accumB = configureCanvas(love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" }), "linear", "linear")
 
-    radianceA = configureCanvas(love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" }), "nearest", "nearest")
-
-    radianceB = configureCanvas(love.graphics.newCanvas(renderWidth, renderHeight, { format = "rgba16f" }), "nearest", "nearest")
-
     accumSrc = accumA
     accumDst = accumB
-    radianceSrc = radianceA
-    radianceDst = radianceB
 
     clearAll()
     currentFrame = 0
-    syncPreviousCameraToCurrent()
     governor.updateRenderVRAMEstimate(runtimeGovernor, renderWidth, renderHeight)
 end
 
@@ -711,12 +677,7 @@ local function sendFrameUniforms(passType, historyTex, cacheTex, overrides)
     shader:send("yaw", camera.yaw)
     shader:send("pitch", camera.pitch)
     shader:send("camFov", camera.fov)
-    shader:send("prevCamPos", previousCamera.pos)
-    shader:send("prevYaw", previousCamera.yaw)
-    shader:send("prevPitch", previousCamera.pitch)
-    shader:send("prevCamFov", previousCamera.fov)
     shader:send("tex", historyTex or getFallbackFloatImage())
-    shader:send("radianceCache", cacheTex or getFallbackFloatImage())
 
     shader:send("uMaxBounces", overrides.maxBounces or tracerSettings.maxBounces)
     shader:send("uMaxSteps", overrides.maxSteps or tracerSettings.maxSteps)
@@ -2499,7 +2460,6 @@ local function renderDummyPreviewFrame()
         enableReflections = false,
     })
     drawCanvasToScreen(accumDst)
-    syncPreviousCameraToCurrent()
 end
 
 --#endregion
@@ -2520,16 +2480,7 @@ function love.draw()
     if not isPaused and dummyRenderActive then
         renderDummyPreviewFrame()
     elseif not isPaused then
-        sendFrameUniforms(0, radianceSrc, radianceSrc)
-        radianceDst:renderTo(function()
-            love.graphics.clear(0, 0, 0, 0)
-            love.graphics.setShader(shader)
-            love.graphics.setBlendMode("alpha", "premultiplied")
-            love.graphics.draw(radianceSrc, 0, 0)
-            love.graphics.setShader()
-        end)
-
-        sendFrameUniforms(1, accumSrc, radianceDst)
+        sendFrameUniforms(1, accumSrc, getFallbackFloatImage())
         accumDst:renderTo(function()
             love.graphics.clear(0, 0, 0, 1)
             love.graphics.setShader(shader)
@@ -2541,8 +2492,6 @@ function love.draw()
         drawCanvasToScreen(accumDst)
 
         swapAccum()
-        swapRadianceCache()
-        syncPreviousCameraToCurrent()
         currentFrame = currentFrame + 1
     else
         local pausedCanvas = accumSrc or accumDst

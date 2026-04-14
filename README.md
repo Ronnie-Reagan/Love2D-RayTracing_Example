@@ -126,7 +126,6 @@ Notes:
 ```text
 .
 |-- .gitignore
-|-- build.lua
 |-- Fancy.png
 |-- Love2D-SDF-RayTracer-LOGO.png
 |-- governor.lua
@@ -149,7 +148,6 @@ Notes:
 - `governor.lua` - adaptive render-scale and memory-budget logic
 - `shared/` - small math, path, and vector helpers
 - `objects/` - local runtime OBJ drop folder
-- `build.lua` - packaging config for the LOVE build tool
 
 ## Possible next steps
 
