@@ -1,51 +1,29 @@
 -- objloader.lua
+local mathutil = require("shared.mathutil")
+local pathutil = require("shared.pathutil")
+local vec3 = require("shared.vec3")
+
 local M = {}
 
 local DEFAULT_OPTIONS = {
     generateMissingNormals = true,
-    keepRawArrays = true,
+    keepRawArrays = false,
     splitByMaterial = true,
     splitByObject = true,
     splitByGroup = true,
     splitBySmoothingGroup = true,
 }
 
-local function normalizePath(path)
-    path = tostring(path or "")
-    path = path:gsub("\\", "/")
-    path = path:gsub("/+", "/")
-    return path
-end
-
-local function joinPath(a, b)
-    a = normalizePath(a)
-    b = normalizePath(b)
-
-    if a == "" or a == "." then
-        return b
-    end
-    if b == "" then
-        return a
-    end
-    if a:sub(-1) == "/" then
-        return a .. b
-    end
-    return a .. "/" .. b
-end
-
-local function dirname(path)
-    path = normalizePath(path)
-    local dir = path:match("^(.*)/[^/]*$")
-    if not dir or dir == "" then
-        return "."
-    end
-    return dir
-end
-
-local function basename(path)
-    path = normalizePath(path)
-    return path:match("([^/]+)$") or path
-end
+local normalizePath = pathutil.normalize
+local joinPath = pathutil.join
+local dirname = pathutil.dirname
+local basename = pathutil.basename
+local clamp = mathutil.clamp
+local vec3sub = vec3.sub
+local vec3cross = vec3.cross
+local vec3length = vec3.length
+local vec3normalize = vec3.normalize
+local vec3addInPlace = vec3.addInPlace
 
 local function fileExistsOS(path)
     local f = io.open(path, "rb")
@@ -77,12 +55,6 @@ local function trim(s)
     return (tostring(s or ""):match("^%s*(.-)%s*$") or "")
 end
 
-local function clamp(x, a, b)
-    if x < a then return a end
-    if x > b then return b end
-    return x
-end
-
 local function parseFloat(value, fallback)
     local n = tonumber(value)
     if n == nil then
@@ -98,36 +70,6 @@ local function parseVec3(words, startIndex, fallback)
         parseFloat(words[startIndex + 1], fallback),
         parseFloat(words[startIndex + 2], fallback),
     }
-end
-
-local function vec3sub(a, b)
-    return { a[1] - b[1], a[2] - b[2], a[3] - b[3] }
-end
-
-local function vec3cross(a, b)
-    return {
-        a[2] * b[3] - a[3] * b[2],
-        a[3] * b[1] - a[1] * b[3],
-        a[1] * b[2] - a[2] * b[1],
-    }
-end
-
-local function vec3length(v)
-    return math.sqrt(v[1] * v[1] + v[2] * v[2] + v[3] * v[3])
-end
-
-local function vec3normalize(v)
-    local len = vec3length(v)
-    if len <= 1e-12 then
-        return { 0, 1, 0 }
-    end
-    return { v[1] / len, v[2] / len, v[3] / len }
-end
-
-local function vec3addInPlace(a, b)
-    a[1] = a[1] + b[1]
-    a[2] = a[2] + b[2]
-    a[3] = a[3] + b[3]
 end
 
 local function newBounds()
@@ -172,6 +114,15 @@ local function finalizeBounds(bounds)
             (bounds.min[3] + bounds.max[3]) * 0.5,
         },
     }
+end
+
+local function expandBoundsByBounds(bounds, other)
+    if not other or not other.min or not other.max then
+        return
+    end
+
+    expandBounds(bounds, other.min)
+    expandBounds(bounds, other.max)
 end
 
 local function splitWords(line)
@@ -357,12 +308,37 @@ local function newMaterial(name)
         kd = { 1, 1, 1 },
         ks = { 0, 0, 0 },
         ke = { 0, 0, 0 },
+        tf = { 1, 1, 1 },
         ns = 0.0,
+        ni = 1.5,
         d = 1.0,
         illum = 2,
+        pr = nil,
+        pm = nil,
+        ps = nil,
+        pc = nil,
+        pcr = nil,
+        aniso = nil,
+        anisor = nil,
+        hasTf = false,
+        hasNi = false,
+        hasD = false,
+        hasKe = false,
+        hasPr = false,
+        hasPm = false,
+        hasPs = false,
+        hasPc = false,
+        hasPcr = false,
+        mapKa = nil,
         mapKd = nil,
         mapKs = nil,
+        mapKe = nil,
+        mapTf = nil,
+        mapPr = nil,
+        mapPm = nil,
+        mapPs = nil,
         mapBump = nil,
+        mapNormal = nil,
         mapD = nil,
     }
 end
@@ -403,22 +379,64 @@ local function parseMTLText(text, objPath)
                     current.ks = parseVec3(words, 2, 0.0)
                 elseif head == "Ke" then
                     current.ke = parseVec3(words, 2, 0.0)
+                    current.hasKe = true
+                elseif head == "Tf" then
+                    current.tf = parseVec3(words, 2, 1.0)
+                    current.hasTf = true
                 elseif head == "Ns" then
                     current.ns = parseFloat(words[2], 0.0)
+                elseif head == "Ni" then
+                    current.ni = math.max(1.0, parseFloat(words[2], 1.5))
+                    current.hasNi = true
                 elseif head == "d" then
                     current.d = clamp(parseFloat(words[2], 1.0), 0.0, 1.0)
+                    current.hasD = true
                 elseif head == "Tr" then
                     current.d = 1.0 - clamp(parseFloat(words[2], 0.0), 0.0, 1.0)
+                    current.hasD = true
                 elseif head == "illum" then
                     current.illum = math.floor(parseFloat(words[2], 2))
+                elseif head == "Pr" then
+                    current.pr = clamp(parseFloat(words[2], 1.0), 0.0, 1.0)
+                    current.hasPr = true
+                elseif head == "Pm" then
+                    current.pm = clamp(parseFloat(words[2], 0.0), 0.0, 1.0)
+                    current.hasPm = true
+                elseif head == "Ps" then
+                    current.ps = clamp(parseFloat(words[2], 1.0), 0.0, 1.0)
+                    current.hasPs = true
+                elseif head == "Pc" then
+                    current.pc = clamp(parseFloat(words[2], 0.0), 0.0, 1.0)
+                    current.hasPc = true
+                elseif head == "Pcr" then
+                    current.pcr = clamp(parseFloat(words[2], 0.03), 0.0, 1.0)
+                    current.hasPcr = true
+                elseif head == "aniso" then
+                    current.aniso = clamp(parseFloat(words[2], 0.0), 0.0, 1.0)
+                elseif head == "anisor" then
+                    current.anisor = clamp(parseFloat(words[2], 0.0), 0.0, 1.0)
+                elseif head == "map_Ka" then
+                    current.mapKa = resolveAssetPath(decodeMapPath(line))
                 elseif head == "map_Kd" then
                     current.mapKd = resolveAssetPath(decodeMapPath(line))
                 elseif head == "map_Ks" then
                     current.mapKs = resolveAssetPath(decodeMapPath(line))
+                elseif head == "map_Ke" then
+                    current.mapKe = resolveAssetPath(decodeMapPath(line))
+                elseif head == "map_Tf" then
+                    current.mapTf = resolveAssetPath(decodeMapPath(line))
+                elseif head == "map_Pr" then
+                    current.mapPr = resolveAssetPath(decodeMapPath(line))
+                elseif head == "map_Pm" then
+                    current.mapPm = resolveAssetPath(decodeMapPath(line))
+                elseif head == "map_Ps" then
+                    current.mapPs = resolveAssetPath(decodeMapPath(line))
                 elseif head == "map_d" then
                     current.mapD = resolveAssetPath(decodeMapPath(line))
                 elseif head == "map_Bump" or head == "bump" then
                     current.mapBump = resolveAssetPath(decodeMapPath(line))
+                elseif head == "norm" then
+                    current.mapNormal = resolveAssetPath(decodeMapPath(line))
                 end
             end
         end
@@ -510,6 +528,50 @@ function M.resolvePath(path)
     return nil, nil, candidates
 end
 
+local function inspectOBJText(text)
+    local info = {
+        vertexCount = 0,
+        texcoordCount = 0,
+        normalCount = 0,
+        faceCount = 0,
+        triangleCount = 0,
+        objectCount = 0,
+        groupCount = 0,
+        materialUseCount = 0,
+        mtllibCount = 0,
+    }
+
+    for rawLine in iterateLogicalLines(text) do
+        local line = trim(rawLine:gsub("#.*$", ""))
+        if line ~= "" then
+            local words = splitWords(line)
+            local head = words[1]
+
+            if head == "v" then
+                info.vertexCount = info.vertexCount + 1
+            elseif head == "vt" then
+                info.texcoordCount = info.texcoordCount + 1
+            elseif head == "vn" then
+                info.normalCount = info.normalCount + 1
+            elseif head == "f" then
+                local triCount = math.max(0, (#words - 1) - 2)
+                info.faceCount = info.faceCount + 1
+                info.triangleCount = info.triangleCount + triCount
+            elseif head == "o" then
+                info.objectCount = info.objectCount + 1
+            elseif head == "g" then
+                info.groupCount = info.groupCount + 1
+            elseif head == "usemtl" then
+                info.materialUseCount = info.materialUseCount + 1
+            elseif head == "mtllib" then
+                info.mtllibCount = info.mtllibCount + 1
+            end
+        end
+    end
+
+    return info
+end
+
 local function resolveRelativeTextFile(objBackend, objPath, relPath)
     relPath = trim(relPath)
     if relPath == "" then
@@ -536,6 +598,37 @@ local function resolveRelativeTextFile(objBackend, objPath, relPath)
     end
 
     return nil, nil
+end
+
+function M.inspect(path)
+    local backend, resolved = M.resolvePath(path)
+    if not backend then
+        return nil
+    end
+
+    local text = readText(backend, resolved)
+    if not text then
+        return nil
+    end
+
+    local info = inspectOBJText(text)
+    info.backend = backend
+    info.path = resolved
+
+    local size
+    if backend == "love" and love and love.filesystem and love.filesystem.getInfo then
+        local fileInfo = love.filesystem.getInfo(resolved)
+        size = fileInfo and fileInfo.size or nil
+    else
+        local f = io.open(resolved, "rb")
+        if f then
+            size = f:seek("end")
+            f:close()
+        end
+    end
+    info.fileSizeBytes = tonumber(size) or #text
+
+    return info
 end
 
 local function meshKeyForState(objectName, groupName, materialName, smoothingGroup, options)
@@ -666,6 +759,91 @@ local function generateMissingNormalsForMesh(mesh)
     mesh.triangleCount = #mesh.indices / 3
 end
 
+local function getMeshTriangleCount(mesh)
+    return mesh.triangleCount or math.floor((mesh.indices and #mesh.indices or 0) / 3)
+end
+
+local function buildSceneObjects(scene)
+    local objects = {}
+    local objectIndexByName = {}
+    local totalTriangles = 0
+
+    for meshIndex, mesh in ipairs(scene.meshes) do
+        mesh.meshIndex = meshIndex
+        mesh.triangleCount = getMeshTriangleCount(mesh)
+        totalTriangles = totalTriangles + mesh.triangleCount
+
+        local objectName = trim(mesh.objectName)
+        if objectName == "" then
+            objectName = trim(mesh.name)
+        end
+        if objectName == "" then
+            objectName = "object_" .. tostring(#objects + 1)
+        end
+
+        local objectIndex = objectIndexByName[objectName]
+        local object = objectIndex and objects[objectIndex] or nil
+
+        if not object then
+            objectIndex = #objects + 1
+            object = {
+                name = objectName,
+                meshIndices = {},
+                bounds = newBounds(),
+                triangleCount = 0,
+            }
+            objects[objectIndex] = object
+            objectIndexByName[objectName] = objectIndex
+        end
+
+        mesh.objectIndex = objectIndex
+        object.meshIndices[#object.meshIndices + 1] = meshIndex
+        object.triangleCount = object.triangleCount + mesh.triangleCount
+        expandBoundsByBounds(object.bounds, mesh.bounds)
+    end
+
+    for objectIndex, object in ipairs(objects) do
+        object.objectIndex = objectIndex
+        object.meshCount = #object.meshIndices
+        object.bounds = finalizeBounds(object.bounds)
+    end
+
+    scene.objects = objects
+    scene.objectIndexByName = objectIndexByName
+    scene.objectCount = #objects
+    scene.meshCount = #scene.meshes
+    scene.totalTriangles = totalTriangles
+end
+
+local function buildTriangleSampler(options)
+    local target = math.floor(tonumber(options and options.triangleSampleTarget) or 0)
+    local sourceTotal = math.floor(tonumber(options and options.sourceTriangleCount) or 0)
+
+    if target <= 0 or sourceTotal <= 0 or target >= sourceTotal then
+        return function()
+            return true
+        end
+    end
+
+    local seen = 0
+    local kept = 0
+
+    return function()
+        seen = seen + 1
+        if kept >= target then
+            return false
+        end
+
+        local expectedKept = math.floor((seen * target) / sourceTotal)
+        if expectedKept > kept then
+            kept = kept + 1
+            return true
+        end
+
+        return false
+    end
+end
+
 local function parseOBJText(text, backend, path, options)
     options = options or DEFAULT_OPTIONS
 
@@ -688,6 +866,7 @@ local function parseOBJText(text, backend, path, options)
     local currentGroup = "default"
     local currentMaterial = "default"
     local currentSmoothingGroup = "on"
+    local shouldStoreTriangle = buildTriangleSampler(options)
 
     local function getCurrentMesh()
         ensureMaterial(scene, currentMaterial)
@@ -742,7 +921,9 @@ local function parseOBJText(text, backend, path, options)
                 if valid and #refs >= 3 then
                     local mesh = getCurrentMesh()
                     for i = 2, #refs - 1 do
-                        addTriangleToMesh(mesh, scene, refs[1], refs[i], refs[i + 1])
+                        if shouldStoreTriangle() then
+                            addTriangleToMesh(mesh, scene, refs[1], refs[i], refs[i + 1])
+                        end
                     end
                 end
 
@@ -811,6 +992,8 @@ local function parseOBJText(text, backend, path, options)
         scene.colors = nil
     end
 
+    buildSceneObjects(scene)
+
     return scene
 end
 
@@ -827,26 +1010,47 @@ function M.listModels(folder)
         end
     end
 
-    if love and love.filesystem and love.filesystem.getInfo(folder, "directory") then
-        for _, name in ipairs(love.filesystem.getDirectoryItems(folder)) do
-            addPath(joinPath(folder, name))
+    local function scanLoveDir(dir)
+        if not (love and love.filesystem and love.filesystem.getInfo(dir, "directory")) then
+            return
+        end
+
+        for _, name in ipairs(love.filesystem.getDirectoryItems(dir)) do
+            local relPath = joinPath(dir, name)
+            local info = love.filesystem.getInfo(relPath)
+            if info and info.type == "directory" then
+                scanLoveDir(relPath)
+            else
+                addPath(relPath)
+            end
         end
     end
+
+    scanLoveDir(folder)
 
     local isWindows = package.config:sub(1, 1) == "\\"
     for _, root in ipairs(getSearchRoots()) do
         local abs = joinPath(root, folder)
         local cmd
         if isWindows then
-            cmd = 'dir /b "' .. abs:gsub("/", "\\") .. '" 2>nul'
+            cmd = 'dir /b /s /a-d "' .. joinPath(abs, "*.obj"):gsub("/", "\\") .. '" 2>nul'
         else
-            cmd = 'ls -1 "' .. abs:gsub('"', '\\"') .. '" 2>/dev/null'
+            cmd = 'find "' .. abs:gsub('"', '\\"') .. '" -type f \\( -iname "*.obj" \\) 2>/dev/null'
         end
 
         local p = io.popen(cmd)
         if p then
+            local absPrefix = normalizePath(abs):lower()
             for line in p:lines() do
-                addPath(joinPath(folder, line))
+                local resolved = normalizePath(line)
+                local lowered = resolved:lower()
+
+                if lowered:sub(1, #absPrefix) == absPrefix then
+                    local suffix = resolved:sub(#absPrefix + 1):gsub("^/", "")
+                    addPath(joinPath(folder, suffix))
+                else
+                    addPath(resolved)
+                end
             end
             p:close()
         end
